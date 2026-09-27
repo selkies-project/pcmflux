@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use libpulse_binding as pulse;
 use pulse::callbacks::ListResult;
+use pulse::channelmap::Map as ChannelMap;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::def::BufferAttr;
 use pulse::sample::{Format, Spec};
@@ -1186,6 +1187,22 @@ fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
     }
 }
 
+/// The speaker positions the surround encoder takes its input channels as, in order, as a
+/// PulseAudio channel map: Chromium's 5.1 and 7.1 orders (left, right, center, LFE, then the
+/// surround pair, and at 7.1 the back pair before the side one), which its `multiopus`
+/// decoder hands to the output layout. The record stream asks for this map, so the sound
+/// server remixes the source's own layout into it. Without one, libpulse gives a stream its
+/// AIFF default, which at six channels names front-left-of-center, front-right-of-center, and
+/// rear-center instead of the surround pair and LFE, and at eight has no map at all, so the
+/// stream cannot even be created. `None` for mono and stereo, whose defaults are right.
+fn surround_channel_map(channels: i32) -> Option<&'static str> {
+    match channels {
+        6 => Some("front-left,front-right,front-center,lfe,rear-left,rear-right"),
+        8 => Some("front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right"),
+        _ => None,
+    }
+}
+
 /// One encode surface over both Opus APIs: the single-stream C encoder for mono/stereo, and
 /// the multistream one for 6/8-channel surround.
 enum PcmEncoder {
@@ -1908,7 +1925,8 @@ fn pa_capture_session_open(
         }
     }
 
-    let mut stream = match Stream::new(&mut context, "Audio Capture", spec, None) {
+    let map = surround_channel_map(spec.channels as i32).and_then(|m| ChannelMap::new_from_string(m).ok());
+    let mut stream = match Stream::new(&mut context, "Audio Capture", spec, map.as_ref()) {
         Some(s) => s,
         None => return Err(tr("pa_stream_new() failed")),
     };
@@ -3055,6 +3073,24 @@ mod tests {
                 .0;
             assert_eq!(loudest, 2, "tone did not come back on FC: rms={rms:?}");
         }
+    }
+
+    /// Every surround layout the encoder takes has a channel map libpulse parses, with one
+    /// position per channel and the front pair, center, and LFE where the encoder reads them.
+    #[test]
+    fn surround_channel_maps_parse() {
+        use pulse::channelmap::Position;
+        for channels in [6, 8] {
+            let map = ChannelMap::new_from_string(surround_channel_map(channels).unwrap())
+                .expect("parses");
+            assert_eq!(map.len() as i32, channels);
+            let pos = map.get();
+            assert_eq!(
+                &pos[..4],
+                &[Position::FrontLeft, Position::FrontRight, Position::FrontCenter, Position::Lfe]
+            );
+        }
+        assert!(surround_channel_map(2).is_none() && surround_channel_map(1).is_none());
     }
 
     /// `valid_opus_duration` accepts exactly the six legal Opus frame durations and
