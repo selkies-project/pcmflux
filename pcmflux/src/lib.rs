@@ -889,9 +889,10 @@ fn await_start(
 /// Bounded, drop-oldest byte queue for the mic-PCM handoff into the virtual
 /// "input" sink — the whole of the playback path's buffering in a single bound.
 ///
-/// `push` runs on the Python side with the GIL released; `drain_upto` runs on the
-/// playback thread. Overflow discards the OLDEST bytes, keeping the newest window (mic
-/// audio is drift-tolerant and stale samples are worthless).
+/// `push` runs on the Python side with the GIL released; `drain_upto` and
+/// `splice_head` run on the playback thread. Overflow discards the OLDEST bytes, keeping
+/// the newest window (mic audio is drift-tolerant and stale samples are worthless); the
+/// depth that stands below the bound is cut by the playback thread (`StandingDepth`).
 struct PlayQueue {
     buf: Mutex<VecDeque<u8>>,
     /// Bounds (re)published by `start()`; atomics so a restart can reconfigure the
@@ -944,13 +945,96 @@ impl PlayQueue {
 
     /// Drain up to `n` bytes into `out`, clamped to what is queued and floored to a
     /// whole frame, since a PA write must be a multiple of the sample-spec frame size.
-    fn drain_upto(&self, n: usize, out: &mut Vec<u8>) {
+    /// Returns the bytes left queued.
+    fn drain_upto(&self, n: usize, out: &mut Vec<u8>) -> usize {
         let fb = self.frame_bytes.load(Ordering::Relaxed);
         let mut q = self.buf.lock().unwrap_or_else(|e| e.into_inner());
         let mut take = n.min(q.len());
         take -= take % fb;
         out.clear();
         out.extend(q.drain(..take));
+        q.len()
+    }
+
+    /// Cut `cut` bytes out right behind the head, the next audio the sink plays: the
+    /// `fade` bytes at the head, which continue what the sink already holds, are blended
+    /// linearly into the `fade` bytes after the cut, so the seam is a short crossfade
+    /// rather than a step. Both are floored to whole frames, and nothing is cut unless
+    /// `cut + fade` bytes are queued.
+    fn splice_head(&self, cut: usize, fade: usize) {
+        let fb = self.frame_bytes.load(Ordering::Relaxed);
+        let (cut, fade) = (cut / fb * fb, fade / fb * fb);
+        let mut q = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        if cut == 0 || cut + fade > q.len() {
+            return;
+        }
+        let channels = (fb / 2).max(1);
+        let frames = (fade / fb) as f32;
+        for i in (0..fade).step_by(2) {
+            let w = ((i / 2 / channels) as f32 + 1.0) / (frames + 1.0);
+            let a = i16::from_le_bytes([q[i], q[i + 1]]) as f32;
+            let b = i16::from_le_bytes([q[cut + i], q[cut + i + 1]]) as f32;
+            let [lo, hi] = ((a + (b - a) * w).round() as i16).to_le_bytes();
+            q[cut + i] = lo;
+            q[cut + i + 1] = hi;
+        }
+        q.drain(..cut);
+    }
+}
+
+/// The playback queue's standing depth, and when to cut it.
+///
+/// The bytes left queued after each drain are tracked at their minimum over a window of
+/// one second of written audio. What stayed queued at every drain of a whole window was
+/// never needed to ride out the uplink's jitter, which the sink's own buffer covers, so it
+/// is pure delay: a burst after a network stall or a stalled tab, a client clock running
+/// fast of the sink, or a sink that resumed late leaves it there, and with the drain rate
+/// equal to the arrival rate it would stay for the rest of the session. A window that
+/// closes with at least `min_cut` of it above `keep` cuts down to `keep`, the length of
+/// the splice's crossfade; smaller excess waits, so drift is shed in a few cuts rather than
+/// a splice every window.
+struct StandingDepth {
+    window: usize,
+    keep: usize,
+    min_cut: usize,
+    frame_bytes: usize,
+    written: usize,
+    min_left: usize,
+}
+
+impl StandingDepth {
+    /// Size the window, the crossfade kept, and the least cut for a stream of
+    /// `bytes_per_sec` in frames of `frame_bytes`: one second, 2 ms, and 10 ms.
+    fn new(bytes_per_sec: usize, frame_bytes: usize) -> Self {
+        let fb = frame_bytes.max(1);
+        let frames = |ms: usize| (bytes_per_sec * ms / 1000 / fb).max(1) * fb;
+        StandingDepth {
+            window: frames(1000),
+            keep: frames(2),
+            min_cut: frames(10),
+            frame_bytes: fb,
+            written: 0,
+            min_left: usize::MAX,
+        }
+    }
+
+    /// Start a fresh window, as after the queue was cleared.
+    fn reset(&mut self) {
+        self.written = 0;
+        self.min_left = usize::MAX;
+    }
+
+    /// Record one drain that wrote `written` bytes and left `left` queued; returns the
+    /// bytes to cut when this drain closes a window over a standing excess.
+    fn after_drain(&mut self, written: usize, left: usize) -> Option<usize> {
+        self.written += written;
+        self.min_left = self.min_left.min(left);
+        if self.written < self.window {
+            return None;
+        }
+        let excess = self.min_left.saturating_sub(self.keep);
+        self.reset();
+        (excess >= self.min_cut).then(|| excess / self.frame_bytes * self.frame_bytes)
     }
 }
 
@@ -2388,6 +2472,9 @@ fn pa_playback_session_open(
 /// `free_cb = None`, so PA copies the bytes and the `scratch` buffer is reused next
 /// iteration. Newly queued bytes are picked up on the next pump — no cross-thread wakeup is
 /// needed, mirroring capture's poll style — and a stop is observed within the pump bound.
+/// Each drain feeds `StandingDepth`, and depth that stood through a whole window is
+/// spliced out of the queue's head, so the uplink's delay returns to the sink's own
+/// buffer after a burst and does not grow with a client clock running fast.
 fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
 
@@ -2427,8 +2514,11 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
 
     let mut scratch: Vec<u8> = Vec::new();
     let mut bytes_written: u64 = 0;
+    let mut bytes_cut: u64 = 0;
     let mut writable_hits: u64 = 0;
     let mut last_pb_log = Instant::now();
+    let mut standing =
+        StandingDepth::new(spec.bytes_per_second(), spec.frame_size());
 
     loop {
         if inner.stop_pending() {
@@ -2455,6 +2545,7 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
                         // Mic audio queued during the outage is stale; playing it out
                         // would only push that much extra latency into the uplink.
                         queue.clear();
+                        standing.reset();
                         plog!("[pcmflux] audio playback reconnected; resuming.");
                     }
                 }
@@ -2491,7 +2582,7 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         if let Some(can) = s.stream.writable_size()
             && can > 0 {
                 writable_hits += 1;
-                queue.drain_upto(can, &mut scratch);
+                let left = queue.drain_upto(can, &mut scratch);
                 if !scratch.is_empty() {
                     if let Err(e) =
                         s.stream.write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
@@ -2501,10 +2592,14 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
                         bytes_written += scratch.len() as u64;
                     }
                 }
+                if let Some(cut) = standing.after_drain(scratch.len(), left) {
+                    queue.splice_head(cut, standing.keep);
+                    bytes_cut += cut as u64;
+                }
             }
         if inner.debug_logging.load(Ordering::Relaxed) && last_pb_log.elapsed().as_secs() >= 1 {
             plog!(
-                "[pcmflux] Playback | writable_hits: {writable_hits}, bytes_written: {bytes_written}, queued: {}",
+                "[pcmflux] Playback | writable_hits: {writable_hits}, bytes_written: {bytes_written}, queued: {}, standing depth cut: {bytes_cut}",
                 queue.buf.lock().map(|q| q.len()).unwrap_or(0)
             );
             last_pb_log = Instant::now();
@@ -3434,6 +3529,94 @@ mod tests {
         let mut out = Vec::new();
         q.drain_upto(100, &mut out);
         assert_eq!(out, vec![4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    /// A splice drops exactly the cut, blends the head into the audio after the cut over
+    /// the fade (first blended sample next to the head, last next to the tail), leaves the
+    /// rest untouched, and does nothing when the queue cannot hold the cut and the fade.
+    #[test]
+    fn playqueue_splice_crossfades_the_seam() {
+        let q = PlayQueue::new();
+        q.configure(1 << 20, 2);
+        let head: Vec<i16> = vec![1000; 48];
+        let tail: Vec<i16> = (0..200).map(|i| -2000 + i).collect();
+        q.push(bytemuck::cast_slice(&head));
+        q.push(bytemuck::cast_slice(&[0i16; 52]));
+        q.push(bytemuck::cast_slice(&tail));
+        q.splice_head(200, 96);
+        let mut out = Vec::new();
+        assert_eq!(q.drain_upto(1 << 20, &mut out), 0);
+        let got: Vec<i16> = bytemuck::cast_slice::<u8, i16>(&out).to_vec();
+        assert_eq!(got.len(), 200);
+        assert!((got[0] - 1000).abs() < 70, "first sample stays near the head: {}", got[0]);
+        assert!((got[47] - tail[47]).abs() < 70, "last blended sample reaches the tail: {}", got[47]);
+        assert!(got.windows(2).take(48).all(|w| (w[1] - w[0]).abs() < 70), "no step inside the fade");
+        assert_eq!(&got[48..], &tail[48..]);
+
+        let short = PlayQueue::new();
+        short.configure(1 << 20, 2);
+        short.push(&[1, 0, 2, 0, 3, 0]);
+        short.splice_head(4, 4);
+        let mut out = Vec::new();
+        short.drain_upto(100, &mut out);
+        assert_eq!(out, vec![1, 0, 2, 0, 3, 0]);
+    }
+
+    /// The queue against the real sink cadence, simulated: 20 ms packets arrive on a
+    /// client clock, the sink drains 10 ms whenever it has room, and `StandingDepth` cuts
+    /// what stood through a window. A 500 ms stall followed by its burst is shed within two
+    /// windows, and a client clock 0.1 % fast (1 ms more per second than the sink plays)
+    /// never lets the depth past the 10 ms cut threshold and a packet over ten minutes;
+    /// without the cut both would hold their excess (the burst) or grow without bound.
+    #[test]
+    fn standing_depth_is_shed_after_bursts_and_drift() {
+        fn run(stall: bool, skew: f64, seconds: f64, cut: bool) -> (usize, usize) {
+            let (rate, fb) = (24_000usize, 2usize);
+            let q = PlayQueue::new();
+            q.configure(96_000, fb);
+            let mut standing = StandingDepth::new(rate * fb, fb);
+            let packet = vec![0u8; 960];
+            let mut out = Vec::new();
+            let (mut t, mut next_arrival, mut k) = (0.0f64, 0.0f64, 0u64);
+            let (mut worst_late, mut end) = (0usize, 0usize);
+            let mut held = 0u64;
+            while t < seconds {
+                while next_arrival <= t {
+                    let in_stall = stall && (5.0..5.5).contains(&next_arrival);
+                    if in_stall {
+                        held += 1;
+                    } else {
+                        for _ in 0..=held {
+                            q.push(&packet);
+                        }
+                        held = 0;
+                    }
+                    k += 1;
+                    next_arrival = k as f64 * 0.020 / (1.0 + skew);
+                }
+                let left = q.drain_upto(480, &mut out);
+                if cut
+                    && let Some(n) = standing.after_drain(out.len(), left)
+                {
+                    q.splice_head(n, standing.keep);
+                }
+                let depth = q.buf.lock().unwrap().len();
+                if t > 8.0 {
+                    worst_late = worst_late.max(depth);
+                }
+                end = depth;
+                t += 0.010;
+            }
+            (worst_late, end)
+        }
+        let (late, _) = run(true, 0.0, 30.0, true);
+        assert!(late <= 960 + 480, "burst shed by 8 s: {late} bytes still standing");
+        let (_, held) = run(true, 0.0, 30.0, false);
+        assert!(held >= 20_000, "without the cut the burst stands: {held}");
+        let (drift, _) = run(false, 0.001, 600.0, true);
+        assert!(drift <= 480 + 960 + 96, "drift bounded: {drift} bytes");
+        let (_, grown) = run(false, 0.001, 600.0, false);
+        assert!(grown >= 25_000, "without the cut drift grows: {grown}");
     }
 
     /// `worker_alive` (which gates `AudioPlayback::write`) tracks the lifecycle: it is
