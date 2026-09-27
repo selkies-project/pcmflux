@@ -129,7 +129,9 @@
             statusDiv.textContent = "Receiving audio stream...";
 
             // Wire format: 2-byte header [0x01, 0x00] then Opus. byte 0 = audio-chunk
-            // tag, byte 1 = reserved; emitted natively by pcmflux (omit_audio_header=False).
+            // tag, byte 1 = RED block count (0 here); emitted natively by pcmflux
+            // (omit_audio_header=False). A bare [0x01, 0x80] marks where the capture's
+            // silence gate closed and carries no Opus.
             const dataView = new DataView(event.data);
             const dataType = dataView.getUint8(0);
 
@@ -137,6 +139,7 @@
             if (dataType === 0x01) {
                 // Extract the raw Opus data, skipping the 2-byte header.
                 const opusData = event.data.slice(2);
+                if (opusData.byteLength === 0) return;
 
                 // Simple backpressure: if the decoder queue is getting too long, drop the packet.
                 if (audioDecoder.decodeQueueSize > 10) {
