@@ -534,6 +534,8 @@ impl AudioPlaybackSettings {
 struct AudioFrame {
     data: Vec<u8>,
     pts: u64,
+    /// Channels the frame's Opus carries: the capture's own, or 2 for its stereo companion.
+    channels: u8,
     /// Set when the buffer came from a capture's `BufferPool`; recycled to it on drop.
     pool: Option<Arc<BufferPool>>,
 }
@@ -555,6 +557,13 @@ impl AudioFrame {
     #[getter]
     fn pts(&self) -> u64 {
         self.pts
+    }
+
+    /// Channels the frame's Opus carries: the capture's own count, or 2 for a frame of the
+    /// stereo companion (`AudioCapture.set_stereo_companion`), which shares its pts.
+    #[getter]
+    fn channels(&self) -> u8 {
+        self.channels
     }
 
     /// Expose the owned bytes to Python's buffer protocol without a copy.
@@ -626,6 +635,8 @@ struct Inner {
     use_silence_gate: AtomicBool,
     debug_logging: AtomicBool,
     emit_audio_header: AtomicBool,
+    /// Whether a surround capture also emits every frame downmixed to stereo; toggled live.
+    stereo_companion: AtomicBool,
 }
 
 impl Inner {
@@ -641,6 +652,7 @@ impl Inner {
             use_silence_gate: AtomicBool::new(true),
             debug_logging: AtomicBool::new(false),
             emit_audio_header: AtomicBool::new(true),
+            stereo_companion: AtomicBool::new(false),
         }
     }
 
@@ -1293,6 +1305,27 @@ fn surround_channel_map(channels: i32) -> Option<&'static str> {
     }
 }
 
+/// Fold one surround frame (`surround_channel_map` order) to interleaved stereo, `dst`
+/// holding the frame's samples per channel twice: each side takes its front channel at
+/// unity and the center and its surround channels at -3 dB (ITU-R BS.775, the LFE left
+/// out), saturating rather than wrapping, as a browser's own speaker downmix of the
+/// surround stream sounds.
+fn downmix_stereo(src: &[i16], channels: usize, dst: &mut [i16]) {
+    const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    for (f, out) in dst.chunks_exact_mut(2).enumerate() {
+        let s = &src[f * channels..(f + 1) * channels];
+        let center = K * s[2] as f32;
+        let mut left = s[0] as f32 + center + K * s[4] as f32;
+        let mut right = s[1] as f32 + center + K * s[5] as f32;
+        if channels >= 8 {
+            left += K * s[6] as f32;
+            right += K * s[7] as f32;
+        }
+        out[0] = left.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        out[1] = right.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
 /// One encode surface over both Opus APIs: the single-stream C encoder for mono/stereo, and
 /// the multistream one for 6/8-channel surround.
 enum PcmEncoder {
@@ -1445,7 +1478,6 @@ impl PcmEncoder {
         }
     }
 
-    /// Retune the encoder's target bitrate live (bits/s), for either API.
     /// The encoder's look-ahead in input samples: what a decoder discards first.
     fn lookahead(&mut self) -> i32 {
         match self {
@@ -1470,6 +1502,7 @@ impl PcmEncoder {
         }
     }
 
+    /// Retune the encoder's target bitrate live (bits/s), for either API.
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
             PcmEncoder::Stereo(enc) => unsafe {
@@ -1498,7 +1531,7 @@ impl PcmEncoder {
 
 /// Backing store for the delivery ring: `Some(queue)` while open, `None` once closed
 /// so `pop` wakes and returns `None` for a clean shutdown.
-type FrameQueue = Option<VecDeque<(Vec<u8>, u64)>>;
+type FrameQueue = Option<VecDeque<(Vec<u8>, u64, u8)>>;
 
 /// Bounded, drop-oldest hand-off from the capture thread to the Python delivery
 /// thread, so a slow or GIL-blocked callback can never stall the PulseAudio pump.
@@ -1527,7 +1560,7 @@ impl DeliveryRing {
 
     /// Enqueue one encoded frame, dropping the oldest (and bumping `dropped`) if the
     /// ring is at capacity, then wake the consumer. A no-op once closed.
-    fn push(&self, data: Vec<u8>, pts: u64) -> Option<Vec<u8>> {
+    fn push(&self, data: Vec<u8>, pts: u64, channels: u8) -> Option<Vec<u8>> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = g.as_mut() else {
             return Some(data);
@@ -1536,14 +1569,14 @@ impl DeliveryRing {
             q.pop_front();
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        q.push_back((data, pts));
+        q.push_back((data, pts, channels));
         self.cv.notify_one();
         None
     }
 
     /// Block until a frame is available and return it, or return `None` once the ring
     /// is closed and drained — the delivery thread's loop condition.
-    fn pop(&self) -> Option<(Vec<u8>, u64)> {
+    fn pop(&self) -> Option<(Vec<u8>, u64, u8)> {
         let mut g = self.q.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             {
@@ -1719,6 +1752,11 @@ struct RunState<'a> {
     /// Whether the last frame was emitted as sound, so the gate closing after it (or the
     /// session dropping) sends the `WS_QUIET` frame once.
     sounding: bool,
+    /// A surround capture's stereo encoder and its downmix scratch, for
+    /// `Inner::stereo_companion`; `None` for mono and stereo captures.
+    companion: Option<(PcmEncoder, Vec<i16>)>,
+    /// The bitrate the companion encoder was last given; follows the capture's.
+    companion_bitrate: i32,
     total_samples_processed: u64,
     /// The Ogg Opus stream on the output socket, and the 48 kHz samples one input
     /// sample is worth for its granule positions.
@@ -1869,8 +1907,11 @@ impl<'a> RunState<'a> {
         }
         data.truncate(prefix + encoded);
 
-        if let Some(data) = self.ring.push(data, pts) {
+        if let Some(data) = self.ring.push(data, pts, self.channels as u8) {
             self.pool.put(data);
+        }
+        if self.inner.stereo_companion.load(Ordering::Relaxed) {
+            self.emit_companion(pts, emit_header);
         }
     }
 
@@ -1887,8 +1928,41 @@ impl<'a> RunState<'a> {
         data[0] = 0x01;
         data[1] = WS_QUIET;
         data.truncate(2);
-        if let Some(data) = self.ring.push(data, pts) {
+        if let Some(data) = self.ring.push(data, pts, self.channels as u8) {
             self.pool.put(data);
+        }
+    }
+
+    /// Emit the stereo companion of the frame just emitted: the frame downmixed
+    /// (`downmix_stereo`), encoded with the companion's own stereo encoder at the capture's
+    /// bitrate, and handed to the delivery thread right after it with the same `pts` and
+    /// `channels == 2`. On the wire it carries the plain two-byte header, never RED, which
+    /// the surround stream's history serves.
+    fn emit_companion(&mut self, pts: u64, emit_header: bool) {
+        let fpc = self.frame_size_per_channel;
+        let channels = self.channels;
+        let bitrate = self.current_applied_bitrate;
+        let Some((encoder, pcm)) = self.companion.as_mut() else {
+            return;
+        };
+        if self.companion_bitrate != bitrate && encoder.set_bitrate(bitrate).is_ok() {
+            self.companion_bitrate = bitrate;
+        }
+        downmix_stereo(&self.accum[..fpc * channels], channels, pcm);
+        let mut data = self.pool.take();
+        let prefix = write_ws_prefix_into(&mut data, pts, &VecDeque::new(), 0, emit_header);
+        match encoder.encode(pcm, fpc, &mut data[prefix..]) {
+            Ok(n) if n > 0 => {
+                data.truncate(prefix + n);
+                if let Some(data) = self.ring.push(data, pts, 2) {
+                    self.pool.put(data);
+                }
+            }
+            Ok(_) => self.pool.put(data),
+            Err(e) => {
+                elog!("[pcmflux] ERROR: stereo companion: {e}");
+                self.pool.put(data);
+            }
         }
     }
 }
@@ -2149,11 +2223,11 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                         let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -10);
                     }
                     deliver_inner.deliver_tid.store(gettid(), Ordering::Release);
-                    while let Some((data, pts)) = deliver_ring.pop() {
+                    while let Some((data, pts, channels)) = deliver_ring.pop() {
                         Python::attach(|py| {
                             let frame = match Py::new(
                                 py,
-                                AudioFrame { data, pts, pool: Some(Arc::clone(&deliver_pool)) },
+                                AudioFrame { data, pts, channels, pool: Some(Arc::clone(&deliver_pool)) },
                             ) {
                                 Ok(f) => f,
                                 Err(e) => {
@@ -2205,6 +2279,18 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
         red_spare: Vec::new(),
         red_distance: settings.red_distance.max(0) as usize,
         sounding: false,
+        companion: if channels > 2 {
+            match PcmEncoder::new(settings.sample_rate, 2, settings.use_vbr, settings.opus_bitrate) {
+                Ok(e) => Some((e, vec![0i16; frame_size_per_channel * 2])),
+                Err(e) => {
+                    elog!("[pcmflux] stereo companion unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        },
+        companion_bitrate: settings.opus_bitrate,
         total_samples_processed: 0,
         ogg,
         ogg_scale,
@@ -2778,6 +2864,15 @@ impl AudioCapture {
         self.inner().opus_bitrate.store(clamped, Ordering::Relaxed);
     }
 
+    /// Have a surround capture also deliver every frame downmixed to stereo, live: each
+    /// surround frame is followed by its companion, the same `pts` and `channels == 2`,
+    /// encoded by a stereo encoder of its own at the capture's bitrate, for consumers
+    /// that decode no multistream Opus. Off by default, it keeps its setting across
+    /// restarts, and a mono or stereo capture ignores it.
+    fn set_stereo_companion(&self, enabled: bool) {
+        self.inner().stereo_companion.store(enabled, Ordering::Relaxed);
+    }
+
     /// True while a capture worker is connected and running with no stop pending; false
     /// while still starting and after a failure — see `state` to tell those apart.
     #[getter]
@@ -3205,6 +3300,92 @@ mod tests {
         }
     }
 
+    /// The stereo fold: the fronts pass at unity to their own side, the center and each
+    /// surround channel at -3 dB to theirs, the LFE nowhere, and a sum past full scale
+    /// saturates instead of wrapping.
+    #[test]
+    fn downmix_stereo_follows_bs775() {
+        let one = |ch: usize, pos: usize, v: i16| {
+            let mut src = vec![0i16; ch];
+            src[pos] = v;
+            let mut dst = [0i16; 2];
+            downmix_stereo(&src, ch, &mut dst);
+            dst
+        };
+        assert_eq!(one(6, 0, 10000), [10000, 0]);
+        assert_eq!(one(6, 1, 10000), [0, 10000]);
+        assert_eq!(one(6, 2, 10000), [7071, 7071]);
+        assert_eq!(one(6, 3, 10000), [0, 0]);
+        assert_eq!(one(6, 4, 10000), [7071, 0]);
+        assert_eq!(one(6, 5, 10000), [0, 7071]);
+        assert_eq!(one(8, 6, 10000), [7071, 0]);
+        assert_eq!(one(8, 7, 10000), [0, 7071]);
+        let mut dst = [0i16; 2];
+        downmix_stereo(&[30000, -30000, 0, 0, 30000, -30000], 6, &mut dst);
+        assert_eq!(dst, [i16::MAX, i16::MIN]);
+    }
+
+    /// With the companion on, a surround capture hands every frame over twice: the
+    /// multistream packet with the capture's channel count, then its stereo fold with the
+    /// same pts, which a plain stereo decoder plays with the center tone on both sides; with
+    /// it off, only the surround frame goes.
+    #[test]
+    fn stereo_companion_follows_each_surround_frame() {
+        let inner = Inner::new();
+        let ring = DeliveryRing::new(64);
+        let frame = 480usize;
+        let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + 4 * MAX_OPUS_PACKET));
+        let mut run = RunState {
+            inner: &inner,
+            ring: &ring,
+            encoder: PcmEncoder::new(48000, 6, true, 256000).expect("encoder"),
+            frame_size_per_channel: frame,
+            channels: 6,
+            accum: vec![0i16; frame * 6],
+            silence_ref: vec![0i16; frame * 6],
+            pcm_fill_bytes: 0,
+            pool: PoolTaker::new(Arc::clone(&pool)),
+            red_history: VecDeque::new(),
+            red_spare: Vec::new(),
+            red_distance: 0,
+            sounding: false,
+            companion: Some((PcmEncoder::new(48000, 2, true, 256000).expect("stereo"), vec![0i16; frame * 2])),
+            companion_bitrate: 256000,
+            total_samples_processed: 0,
+            ogg: None,
+            ogg_scale: 1,
+            first_sound_detected: true,
+            current_applied_bitrate: 256000,
+            chunks_read: 0,
+            chunks_silent: 0,
+            chunks_encoded: 0,
+            bytes_encoded: 0,
+        };
+        let mut pcm = vec![0i16; frame * 6];
+        for i in 0..frame {
+            pcm[i * 6 + 2] = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin() * 8000.0) as i16;
+        }
+        run.feed(bytemuck::cast_slice(&pcm));
+        inner.stereo_companion.store(true, Ordering::Relaxed);
+        for _ in 0..4 {
+            run.feed(bytemuck::cast_slice(&pcm));
+        }
+        let queued = ring.q.lock().unwrap();
+        let frames: Vec<(Vec<u8>, u64, u8)> = queued.as_ref().expect("ring open").iter().cloned().collect();
+        let tags: Vec<(u64, u8)> = frames.iter().map(|(_, p, c)| (*p, *c)).collect();
+        assert_eq!(tags, vec![(0, 6), (480, 6), (480, 2), (960, 6), (960, 2), (1440, 6), (1440, 2), (1920, 6), (1920, 2)]);
+        let mut dec = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
+        let mut last = Vec::new();
+        for (data, _, c) in &frames {
+            if *c == 2 {
+                last = dec.decode_to_pcm(&data[2..]).expect("decodes").to_vec();
+            }
+        }
+        let samples: &[i16] = bytemuck::cast_slice(&last);
+        let rms = |ch: usize| (samples.iter().skip(ch).step_by(2).map(|&v| (v as f64).powi(2)).sum::<f64>() / frame as f64).sqrt();
+        assert!(rms(0) > 2000.0 && rms(1) > 2000.0, "center tone on both sides: {} {}", rms(0), rms(1));
+    }
+
     /// Every surround layout the encoder takes has a channel map libpulse parses, with one
     /// position per channel and the front pair, center, and LFE where the encoder reads them.
     #[test]
@@ -3479,6 +3660,8 @@ mod tests {
                 red_spare: Vec::new(),
                 red_distance: red,
                 sounding: false,
+                companion: None,
+                companion_bitrate: 64000,
                 total_samples_processed: 0,
                 ogg: None,
                 ogg_scale: 1,
@@ -3496,8 +3679,8 @@ mod tests {
             }
             let queued = ring.q.lock().unwrap();
             let frames = queued.as_ref().expect("ring open");
-            let pts: Vec<u64> = frames.iter().map(|(_, p)| *p).collect();
-            let quiet_frames: Vec<&Vec<u8>> = frames.iter().map(|(d, _)| d).filter(|d| d.len() == 2).collect();
+            let pts: Vec<u64> = frames.iter().map(|(_, p, _)| *p).collect();
+            let quiet_frames: Vec<&Vec<u8>> = frames.iter().map(|(d, _, _)| d).filter(|d| d.len() == 2).collect();
             if header {
                 assert_eq!(pts, vec![480, 960, 1440, 2880, 3360], "red={red}");
                 assert_eq!(quiet_frames, vec![&vec![0x01, WS_QUIET]], "red={red}");
@@ -3505,7 +3688,7 @@ mod tests {
                 assert_eq!(frames[3].0[1], 0x00, "sound resumes with the plain header");
             } else {
                 assert_eq!(pts, vec![480, 960, 2880, 3360]);
-                assert!(quiet_frames.is_empty() && frames.iter().all(|(d, _)| d.len() > 2));
+                assert!(quiet_frames.is_empty() && frames.iter().all(|(d, _, _)| d.len() > 2));
             }
         }
     }
@@ -3972,7 +4155,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(32));
         let buf = pool.take();
         let ptr = buf.as_ptr() as usize;
-        drop(AudioFrame { data: buf, pts: 0, pool: Some(Arc::clone(&pool)) });
+        drop(AudioFrame { data: buf, pts: 0, channels: 2, pool: Some(Arc::clone(&pool)) });
         let recycled = pool.take();
         assert_eq!(recycled.as_ptr() as usize, ptr);
     }

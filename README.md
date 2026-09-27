@@ -36,7 +36,7 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 - **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9 and newer)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
 - **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
-- **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8. A surround capture asks the sound server for the speaker positions its encoder reads (front left, right, and center, LFE, the rear pair, and at 7.1 the side pair), so a source of any layout is remixed into them.
+- **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8. A surround capture asks the sound server for the speaker positions its encoder reads (front left, right, and center, LFE, the rear pair, and at 7.1 the side pair), so a source of any layout is remixed into them, and `set_stereo_companion(True)` has it also deliver every frame folded to stereo (ITU-R BS.775, LFE left out) for consumers that decode no multistream Opus: each companion frame follows its surround frame with the same `pts` and `frame.channels == 2`.
 - **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo, and `write` / `write_red` take any bytes-like object (`bytes`, `memoryview`, `bytearray`, ...). Queued audio that stays unplayed through a whole second (after a burst, a stalled client, a sink that resumed late, or a client clock running fast of the sink's) is cut from the head of the queue with a 2 ms crossfade, so the uplink's delay returns to the sink's own buffer (`latency_ms`) instead of standing up to `max_buffer_bytes`.
 - **Live Bitrate Updates:** Thread-safe `update_audio_bitrate()` adjusts the Opus bitrate during an active session.
 - **Observable Lifecycle:** `state` (`"idle"` / `"starting"` / `"running"` / `"failed"`) and `last_error` on both `AudioCapture` and `AudioPlayback`, so a capture that fails after `start_capture` returned (PulseAudio took longer than the start handshake, or dropped out mid-run and could not be reconnected) is visible to the caller. Invalid settings raise `ValueError` before a thread is spawned.
@@ -51,8 +51,8 @@ invokes `callback(frame)` once per *encoded* chunk. When the silence gate is on
 encoding and the callback is simply **not** called for them — it never receives
 an empty frame, so there's no silence to filter out; a capture that emits the
 audio header marks where the silence starts with the two-byte `[0x01, 0x80]`
-frame. The `frame` is a zero-copy
-`AudioFrame` (buffer protocol + a `.pts` presentation timestamp in samples).
+frame. The `frame` is a zero-copy `AudioFrame` (buffer protocol, a `.pts`
+presentation timestamp in samples, and the `.channels` its Opus carries).
 Copy it out with `bytes(frame)` if it must outlive the callback, or pass
 `memoryview(frame)` for a zero-copy hand-off (keep the frame referenced for the
 duration of the send so its buffer stays alive).
