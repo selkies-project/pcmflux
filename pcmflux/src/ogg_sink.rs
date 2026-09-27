@@ -208,8 +208,8 @@ mod tests {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
 
-    /// A consumer that connects reads the two header pages and then every packet page,
-    /// each with a checksum the Ogg polynomial reproduces and the granule it was given.
+    /// A leftover this account owns is removed and the socket bound, and the sink removes
+    /// its socket when it is dropped.
     #[test]
     fn a_stale_socket_of_this_session_is_replaced() {
         let path = format!("/tmp/pcmflux-ogg-stale-{}.sock", std::process::id());
@@ -221,8 +221,14 @@ mod tests {
         assert!(fs::symlink_metadata(&path).is_err(), "the socket is removed with the sink");
     }
 
+    /// A consumer that connects reads the two header pages and then every packet page, each
+    /// with the granule it was given. A packet that fills its last segment exactly is closed by
+    /// a zero lacing value, and the checksum is Ogg's own, whose check value over `123456789` is
+    /// 0x89a1897f: recomputing a page's checksum with this module's function alone would pass
+    /// for any CRC-32, while libogg rejects every page of another.
     #[test]
     fn stream_pages_are_well_formed() {
+        assert_eq!(crc32(b"123456789"), 0x89a1_897f);
         let path = format!("/tmp/pcmflux-ogg-test-{}.sock", std::process::id());
         let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
         let mut sink = OggSink::try_bind(&path, &head).expect("bind");
@@ -240,6 +246,7 @@ mod tests {
             if got.len() >= 27 * 4 + 19 + 27 + 4 + 259 { break; }
         }
         let mut pages = Vec::new();
+        let mut laces = Vec::new();
         let mut at = 0;
         while at + 27 <= got.len() {
             assert_eq!(&got[at..at + 4], b"OggS");
@@ -251,6 +258,7 @@ mod tests {
             copy[22..26].copy_from_slice(&[0; 4]);
             assert_eq!(crc32(&copy), stored, "page {} checksum", pages.len());
             let granule = u64::from_le_bytes(copy[6..14].try_into().unwrap());
+            laces.push(copy[27..27 + segments].to_vec());
             pages.push((granule, copy[27 + segments..].to_vec()));
             at = end;
         }
@@ -261,6 +269,7 @@ mod tests {
         assert_eq!(pages[2], (960, vec![0xfc, 1, 2, 3]));
         assert_eq!(pages[3].0, 1920);
         assert_eq!(pages[3].1.len(), 255);
+        assert_eq!(laces[3], vec![255, 0]);
         drop(sink);
         assert!(!std::path::Path::new(&path).exists());
     }
