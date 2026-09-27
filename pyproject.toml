@@ -39,3 +39,10 @@ before-all = """
         exit 1
     fi
 """
+
+# The manylinux policy leaves libX11 to the host, so the libxcb libpulse needs has to be the host's
+# as well: a bundled copy that loads first binds the host's libX11 to itself, and a library that then
+# calls the host's libxcb on an Xlib connection (the NVIDIA driver's NvFBC) reads another layout.
+[[tool.cibuildwheel.overrides]]
+select = "*-manylinux_*"
+repair-wheel-command = "auditwheel repair --exclude libxcb.so.1 -w {dest_dir} {wheel}"
