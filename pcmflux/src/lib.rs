@@ -116,11 +116,13 @@ const RED_MAX_LEN: usize = 1023;
 const RED_BLOCK_PT: u8 = 0;
 /// Max redundant copies per frame and RED history depth.
 const RED_MAX_DISTANCE: i32 = 4;
-/// Second byte of the two-byte frame a header-carrying capture emits when its silence gate
-/// closes (or its session drops) after a frame of sound: no Opus follows, and it tells a
-/// player that the stream pauses by the sender's choice, so the audio it holds plays out
-/// now and running dry after it is not a late delivery. Distinct from any `n_red`, which
-/// never exceeds `RED_MAX_DISTANCE`.
+/// Bit of a header-carrying capture's second byte that marks where the stream pauses by the
+/// sender's choice. Alone, as `[0x01, WS_QUIET]` with no Opus, it is sent where a sound ends
+/// (and when the session drops after sound): a player plays out what it holds at once
+/// rather than waiting for more, and running dry after it is not a late delivery. It is set
+/// as well on the silent frame sent right behind that mark, whose Opus carries the end of
+/// the sound the encoder held back, so a player appends that frame to the sound rather than
+/// taking it for a new one. Never part of `n_red`, which fits below it (`RED_MAX_DISTANCE`).
 const WS_QUIET: u8 = 0x80;
 
 /// Test-only reference implementation of the WS audio frame body — builds the
@@ -153,7 +155,8 @@ const WS_QUIET: u8 = 0x80;
 ///
 /// A redundant block whose 48 kHz sample offset overflows `RED_MAX_OFFSET` (14 bits) or
 /// whose byte length overflows `RED_MAX_LEN` (10 bits) is skipped, so `n_red` counts only
-/// what fit.
+/// what fit. The second byte's top bit is not part of `n_red`: it is `WS_QUIET`, set by the
+/// emit path on the silent frame that ends a sound.
 #[cfg(test)]
 fn build_ws_body(
     primary: &[u8],
@@ -1750,8 +1753,9 @@ struct RunState<'a> {
     /// is either in the history or here.
     red_spare: Vec<Vec<u8>>,
     red_distance: usize,
-    /// Whether the last frame was emitted as sound, so the gate closing after it (or the
-    /// session dropping) sends the `WS_QUIET` frame once.
+    /// Whether the last frame was emitted as sound, so a header capture's gate lets the silent
+    /// frame after it through (behind the bare `WS_QUIET` mark, and marked itself), and a
+    /// session that drops after it sends the bare mark once.
     sounding: bool,
     /// A surround capture's stereo encoder and its downmix scratch, for
     /// `Inner::stereo_companion`; `None` for mono and stereo captures.
@@ -1808,9 +1812,13 @@ impl<'a> RunState<'a> {
     ///    `frame_size_per_channel` — a monotonic per-frame timestamp used for RED offsets and
     ///    client-side ordering.
     /// 3. **Silence gate**: when enabled, a frame equal to the zeroed `silence_ref` is counted
-    ///    and dropped (no Opus is sent), so pure silence costs no bandwidth; the first one
-    ///    after sound sends the two-byte `WS_QUIET` frame instead (`emit_quiet`). The first
-    ///    non-silent frame logs once.
+    ///    and dropped (no Opus is sent), so pure silence costs no bandwidth. On a header capture
+    ///    the first one after sound is still encoded and sent, since it carries the end of the
+    ///    sound the encoder held back (its lookahead): the bare `WS_QUIET` mark goes first, then
+    ///    that frame with `WS_QUIET` set. A raw Opus capture drops it as well: a WebRTC
+    ///    receiver's jitter buffer fades the sound after a pause in from what it concealed, and
+    ///    concealing from that frame's near-silence fades a short sound further than
+    ///    concealing from the sound. The first non-silent frame logs once.
     /// 4. **Encode in place**: `write_ws_prefix_into` writes the RFC 2198 RED framing prefix
     ///    (which depends only on `pts` + history) into a pooled buffer, and the Opus packet is
     ///    encoded DIRECTLY after it — no assembly copy, and the buffer recycles through the
@@ -1846,9 +1854,11 @@ impl<'a> RunState<'a> {
         let pts = self.total_samples_processed;
         self.total_samples_processed += self.frame_size_per_channel as u64;
 
-        if self.inner.use_silence_gate.load(Ordering::Relaxed)
-            && self.accum == self.silence_ref
-        {
+        let emit_header = self.inner.emit_audio_header.load(Ordering::Relaxed);
+        let silent = self.inner.use_silence_gate.load(Ordering::Relaxed)
+            && self.accum == self.silence_ref;
+        if silent && !(self.sounding && emit_header) {
+            self.sounding = false;
             self.chunks_silent += 1;
             // Flush the RED backlog: if these pre-silence frames were kept, the first
             // packet after a long quiet stretch would ship minutes-old audio as
@@ -1856,7 +1866,6 @@ impl<'a> RunState<'a> {
             // emptied buffers are kept for reuse, so a silence gap costs no allocations.
             self.red_spare
                 .extend(self.red_history.drain(..).map(|(v, _)| v));
-            self.emit_quiet(pts);
             return;
         }
         if !self.first_sound_detected {
@@ -1865,7 +1874,6 @@ impl<'a> RunState<'a> {
         }
 
         let n = self.frame_size_per_channel * self.channels;
-        let emit_header = self.inner.emit_audio_header.load(Ordering::Relaxed);
         let mut data = self.pool.take();
         let prefix = write_ws_prefix_into(
             &mut data,
@@ -1890,7 +1898,7 @@ impl<'a> RunState<'a> {
             self.pool.put(data);
             return;
         }
-        self.sounding = true;
+        self.sounding = !silent;
         self.chunks_encoded += 1;
         self.bytes_encoded += encoded as u64;
         if let Some(sink) = self.ogg.as_mut() {
@@ -1907,24 +1915,32 @@ impl<'a> RunState<'a> {
             self.red_history.push_back((slot, pts));
         }
         data.truncate(prefix + encoded);
+        if silent {
+            self.push_mark(pts);
+            data[1] |= WS_QUIET;
+        }
 
         if let Some(data) = self.ring.push(data, pts, self.channels as u8) {
             self.pool.put(data);
         }
         if self.inner.stereo_companion.load(Ordering::Relaxed) {
-            self.emit_companion(pts, emit_header);
+            self.emit_companion(pts, emit_header, silent);
         }
     }
 
-    /// Tell the delivery thread the stream pauses: once after a frame of sound, a header
-    /// capture pushes the two-byte `[0x01, WS_QUIET]` frame (stamped with the `pts` the
-    /// pause starts at), so a player plays out what it holds rather than waiting for more.
-    /// A raw Opus capture has nothing to frame it with, and its RTP timestamps carry the
-    /// pause already.
+    /// Tell the delivery thread the stream pauses when the session drops after a frame of
+    /// sound: a header capture pushes the bare `[0x01, WS_QUIET]` (stamped with the `pts` the
+    /// pause starts at), since no frame is left to carry the mark, so a player plays out what
+    /// it holds rather than waiting for more. A raw Opus capture has nothing to frame it with,
+    /// and its RTP timestamps carry the pause already.
     fn emit_quiet(&mut self, pts: u64) {
-        if !std::mem::take(&mut self.sounding) || !self.inner.emit_audio_header.load(Ordering::Relaxed) {
-            return;
+        if std::mem::take(&mut self.sounding) && self.inner.emit_audio_header.load(Ordering::Relaxed) {
+            self.push_mark(pts);
         }
+    }
+
+    /// Push the bare `[0x01, WS_QUIET]` stamped `pts`.
+    fn push_mark(&mut self, pts: u64) {
         let mut data = self.pool.take();
         data[0] = 0x01;
         data[1] = WS_QUIET;
@@ -1938,8 +1954,9 @@ impl<'a> RunState<'a> {
     /// (`downmix_stereo`), encoded with the companion's own stereo encoder at the capture's
     /// bitrate, and handed to the delivery thread right after it with the same `pts` and
     /// `channels == 2`. On the wire it carries the plain two-byte header, never RED, which
-    /// the surround stream's history serves.
-    fn emit_companion(&mut self, pts: u64, emit_header: bool) {
+    /// the surround stream's history serves, with `WS_QUIET` set when `ending` (the companion
+    /// of the silent frame that ends a sound).
+    fn emit_companion(&mut self, pts: u64, emit_header: bool, ending: bool) {
         let fpc = self.frame_size_per_channel;
         let channels = self.channels;
         let bitrate = self.current_applied_bitrate;
@@ -1955,6 +1972,9 @@ impl<'a> RunState<'a> {
         match encoder.encode(pcm, fpc, &mut data[prefix..]) {
             Ok(n) if n > 0 => {
                 data.truncate(prefix + n);
+                if ending {
+                    data[1] |= WS_QUIET;
+                }
                 if let Some(data) = self.ring.push(data, pts, 2) {
                     self.pool.put(data);
                 }
@@ -3339,7 +3359,8 @@ mod tests {
     /// With the companion on, a surround capture hands every frame over twice: the
     /// multistream packet with the capture's channel count, then its stereo fold with the
     /// same pts, which a plain stereo decoder plays with the center tone on both sides; with
-    /// it off, only the surround frame goes.
+    /// it off, only the surround frame goes. The fold of the silent frame that ends a sound
+    /// carries that frame's quiet bit.
     #[test]
     fn stereo_companion_follows_each_surround_frame() {
         let inner = Inner::new();
@@ -3381,13 +3402,17 @@ mod tests {
         for _ in 0..4 {
             run.feed(bytemuck::cast_slice(&pcm));
         }
+        let tone_frames = ring.q.lock().unwrap().as_ref().expect("ring open").len();
+        run.feed(bytemuck::cast_slice(&vec![0i16; frame * 6]));
         let queued = ring.q.lock().unwrap();
         let frames: Vec<(Vec<u8>, u64, u8)> = queued.as_ref().expect("ring open").iter().cloned().collect();
-        let tags: Vec<(u64, u8)> = frames.iter().map(|(_, p, c)| (*p, *c)).collect();
-        assert_eq!(tags, vec![(0, 6), (480, 6), (480, 2), (960, 6), (960, 2), (1440, 6), (1440, 2), (1920, 6), (1920, 2)]);
+        let tags: Vec<(u64, u8, bool)> = frames.iter().map(|(d, p, c)| (*p, *c, d[1] & WS_QUIET != 0)).collect();
+        assert_eq!(tags, vec![(0, 6, false), (480, 6, false), (480, 2, false), (960, 6, false), (960, 2, false),
+                              (1440, 6, false), (1440, 2, false), (1920, 6, false), (1920, 2, false),
+                              (2400, 6, true), (2400, 6, true), (2400, 2, true)]);
         let mut dec = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
         let mut last = Vec::new();
-        for (data, _, c) in &frames {
+        for (data, _, c) in &frames[..tone_frames] {
             if *c == 2 {
                 last = dec.decode_to_pcm(&data[2..]).expect("decodes").to_vec();
             }
@@ -3645,10 +3670,11 @@ mod tests {
     }
 
     /// The emit path pauses a header stream exactly once per gated run: frames of sound
-    /// around a stretch of digital silence go out with their Opus, the first gated frame
-    /// sends the bare `[0x01, WS_QUIET]` stamped with the pts the pause starts at, the
-    /// frames after it send nothing, and sound resumes with the plain header (RED on or off,
-    /// since the gate empties the history). A raw Opus capture sends no marker at all.
+    /// around a stretch of digital silence go out with their Opus, then the bare
+    /// `[0x01, WS_QUIET]` where the sound ends, then the first silent frame (it carries the end
+    /// of the sound) with `WS_QUIET` set too, the frames after it send nothing, and sound
+    /// resumes with the plain header (RED on or off, since the gate empties the history). A raw
+    /// Opus capture sends the frames of sound alone.
     #[test]
     fn gated_silence_sends_one_quiet_frame() {
         for (red, header) in [(0usize, true), (2, true), (0, false)] {
@@ -3693,13 +3719,130 @@ mod tests {
             let pts: Vec<u64> = frames.iter().map(|(_, p, _)| *p).collect();
             let quiet_frames: Vec<&Vec<u8>> = frames.iter().map(|(d, _, _)| d).filter(|d| d.len() == 2).collect();
             if header {
-                assert_eq!(pts, vec![480, 960, 1440, 2880, 3360], "red={red}");
+                assert_eq!(pts, vec![480, 960, 1440, 1440, 2880, 3360], "red={red}");
                 assert_eq!(quiet_frames, vec![&vec![0x01, WS_QUIET]], "red={red}");
-                assert_eq!(frames[2].0.len(), 2, "the marker sits where the pause starts");
-                assert_eq!(frames[3].0[1], 0x00, "sound resumes with the plain header");
+                assert_eq!(frames[2].0.len(), 2, "the bare mark goes where the sound ends");
+                assert!(frames[3].0.len() > 2 && frames[3].0[1] & WS_QUIET != 0,
+                        "the silent frame behind it carries the mark too");
+                assert!(frames.iter().enumerate().all(|(i, (d, _, _))| i == 2 || i == 3 || d[1] & WS_QUIET == 0));
+                assert_eq!(frames[4].0[1], 0x00, "sound resumes with the plain header");
             } else {
                 assert_eq!(pts, vec![480, 960, 2880, 3360]);
                 assert!(quiet_frames.is_empty() && frames.iter().all(|(d, _, _)| d.len() > 2));
+            }
+        }
+    }
+
+    /// A sound in the last 2.5 ms of the frame before the gate closes reaches a header
+    /// capture's decoder: the encoder holds that much back until the next frame, so the frame
+    /// that ends the sound is sent, behind the bare mark and marked itself.
+    #[test]
+    fn a_header_capture_sends_the_tail_of_a_sound_before_the_gate() {
+        let inner = Inner::new();
+        inner.emit_audio_header.store(true, Ordering::Relaxed);
+        let ring = DeliveryRing::new(64);
+        let frame = 480usize;
+        let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + MAX_OPUS_PACKET));
+        let mut run = RunState {
+            inner: &inner,
+            ring: &ring,
+            encoder: PcmEncoder::new(48000, 2, true, 128000).expect("encoder"),
+            frame_size_per_channel: frame,
+            channels: 2,
+            accum: vec![0i16; frame * 2],
+            silence_ref: vec![0i16; frame * 2],
+            pcm_fill_bytes: 0,
+            pool: PoolTaker::new(Arc::clone(&pool)),
+            red_history: VecDeque::new(),
+            red_spare: Vec::new(),
+            red_distance: 0,
+            sounding: false,
+            companion: None,
+            companion_bitrate: 128000,
+            total_samples_processed: 0,
+            ogg: None,
+            ogg_scale: 1,
+            first_sound_detected: true,
+            current_applied_bitrate: 128000,
+            chunks_read: 0,
+            chunks_silent: 0,
+            chunks_encoded: 0,
+            bytes_encoded: 0,
+        };
+        let mut click = vec![0i16; frame * 2];
+        for i in frame - 96..frame {
+            let v = ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0) as i16;
+            click[i * 2] = v;
+            click[i * 2 + 1] = v;
+        }
+        let quiet = vec![0i16; frame * 2];
+        for pcm in [&quiet, &click, &quiet, &quiet, &quiet] {
+            run.feed(bytemuck::cast_slice(pcm));
+        }
+        let queued = ring.q.lock().unwrap();
+        let marked: Vec<(u64, usize)> = queued.as_ref().expect("ring open").iter()
+            .filter(|(d, _, _)| d[1] & WS_QUIET != 0).map(|(d, p, _)| (*p, d.len().min(3))).collect();
+        assert_eq!(marked, vec![(960, 2), (960, 3)], "the bare mark, then the frame that ends the sound");
+        let mut decoder = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
+        let mut peak = 0i32;
+        for (data, _, _) in queued.as_ref().expect("ring open") {
+            if data.len() <= 2 {
+                continue;
+            }
+            let pcm: &[i16] = bytemuck::cast_slice(decoder.decode_to_pcm(&data[2..]).expect("decode"));
+            peak = peak.max(pcm.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
+        }
+        assert!(peak > 8000, "the sound's tail decodes at {peak}");
+    }
+
+    /// A session that drops after sound leaves no frame to carry the mark, so a header capture
+    /// sends the bare `[0x01, WS_QUIET]` once; one that drops in silence, or a raw capture,
+    /// sends nothing.
+    #[test]
+    fn a_dropped_session_after_sound_sends_the_bare_mark_once() {
+        for header in [true, false] {
+            let inner = Inner::new();
+            inner.emit_audio_header.store(header, Ordering::Relaxed);
+            let ring = DeliveryRing::new(64);
+            let frame = 480usize;
+            let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + MAX_OPUS_PACKET));
+            let mut run = RunState {
+                inner: &inner,
+                ring: &ring,
+                encoder: PcmEncoder::new(48000, 2, true, 64000).expect("encoder"),
+                frame_size_per_channel: frame,
+                channels: 2,
+                accum: vec![0i16; frame * 2],
+                silence_ref: vec![0i16; frame * 2],
+                pcm_fill_bytes: 0,
+                pool: PoolTaker::new(Arc::clone(&pool)),
+                red_history: VecDeque::new(),
+                red_spare: Vec::new(),
+                red_distance: 0,
+                sounding: false,
+                companion: None,
+                companion_bitrate: 64000,
+                total_samples_processed: 0,
+                ogg: None,
+                ogg_scale: 1,
+                first_sound_detected: true,
+                current_applied_bitrate: 64000,
+                chunks_read: 0,
+                chunks_silent: 0,
+                chunks_encoded: 0,
+                bytes_encoded: 0,
+            };
+            run.emit_quiet(0);
+            let tone: Vec<i16> = (0..frame * 2).map(|i| ((i as f64 * 0.3).sin() * 8000.0) as i16).collect();
+            run.feed(bytemuck::cast_slice(&tone));
+            run.emit_quiet(480);
+            run.emit_quiet(480);
+            let queued = ring.q.lock().unwrap();
+            let bare: Vec<&Vec<u8>> = queued.as_ref().expect("ring open").iter().map(|(d, _, _)| d).filter(|d| d.len() == 2).collect();
+            if header {
+                assert_eq!(bare, vec![&vec![0x01, WS_QUIET]]);
+            } else {
+                assert!(bare.is_empty());
             }
         }
     }

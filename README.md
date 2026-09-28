@@ -32,7 +32,7 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 - **PulseAudio Capture:** Captures system audio via PulseAudio using the asynchronous `Context`/`Stream` record API with a manually-pumped mainloop.
 - **Opus Encoding:** Integrates the high-quality, low-latency Opus codec.
 - **Silence Detection:** Intelligently skips encoding and sending silent audio chunks.
-- **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. When the silence gate closes after sound (or the sound server drops the capture), a single two-byte `[0x01, 0x80]` chunk with no Opus follows, so a player plays out what it holds instead of waiting for more and can tell the sender's silence from a late delivery; in other chunks the second byte is the RED block count. Set it to `True` for raw Opus (WebRTC/RTP).
+- **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. When the silence gate closes after sound, a single two-byte `[0x01, 0x80]` chunk with no Opus marks where the sound ends (as it does when the sound server drops the capture), so a player plays out what it holds instead of waiting for more and can tell the sender's silence from a late delivery; the first silent chunk follows it with the same bit set, since its Opus carries the end of the sound the encoder held back, and a player appends it to that sound. Below that bit, the second byte is the RED block count. Set it to `True` for raw Opus (WebRTC/RTP).
 - **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9 and newer)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
 - **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
@@ -49,9 +49,13 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 invokes `callback(frame)` once per *encoded* chunk. When the silence gate is on
 (`use_silence_gate=True`, the default), silent chunks are dropped before
 encoding and the callback is simply **not** called for them — it never receives
-an empty frame, so there's no silence to filter out; a capture that emits the
-audio header marks where the silence starts with the two-byte `[0x01, 0x80]`
-frame. The `frame` is a zero-copy `AudioFrame` (buffer protocol, a `.pts`
+an empty frame, so there's no silence to filter out. On a capture that emits the
+audio header, the first silent chunk after sound is the exception: it carries the
+end of the sound the encoder held back, so it is encoded and delivered right behind
+the two-byte `[0x01, 0x80]` frame that marks where the silence starts. A raw Opus
+capture drops it like the rest: a WebRTC receiver's jitter buffer fades the sound
+after a pause in from what it concealed, and concealing from that chunk's
+near-silence fades a short sound further. The `frame` is a zero-copy `AudioFrame` (buffer protocol, a `.pts`
 presentation timestamp in samples, and the `.channels` its Opus carries).
 Copy it out with `bytes(frame)` if it must outlive the callback, or pass
 `memoryview(frame)` for a zero-copy hand-off (keep the frame referenced for the
