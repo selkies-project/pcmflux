@@ -49,13 +49,14 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 invokes `callback(frame)` once per *encoded* chunk. When the silence gate is on
 (`use_silence_gate=True`, the default), silent chunks are dropped before
 encoding and the callback is simply **not** called for them — it never receives
-an empty frame, so there's no silence to filter out. On a capture that emits the
-audio header, the first silent chunk after sound is the exception: it carries the
-end of the sound the encoder held back, so it is encoded and delivered right behind
-the two-byte `[0x01, 0x80]` frame that marks where the silence starts. A raw Opus
-capture drops it like the rest: a WebRTC receiver's jitter buffer fades the sound
-after a pause in from what it concealed, and concealing from that chunk's
-near-silence fades a short sound further. The `frame` is a zero-copy `AudioFrame` (buffer protocol, a `.pts`
+an empty frame, so there's no silence to filter out. The first silent chunk after
+sound is the exception when it carries the end of the sound the encoder held back
+(its 2.5 ms lookahead): a capture that emits the audio header always delivers it,
+right behind the two-byte `[0x01, 0x80]` frame that marks where the silence starts,
+and a raw Opus capture delivers it only when the sound reached into that lookahead,
+since a WebRTC receiver's jitter buffer fades the sound after a pause in from what it
+concealed, and concealing from a chunk of silence faded more short sounds than
+concealing from the sound itself. The `frame` is a zero-copy `AudioFrame` (buffer protocol, a `.pts`
 presentation timestamp in samples, and the `.channels` its Opus carries).
 Copy it out with `bytes(frame)` if it must outlive the callback, or pass
 `memoryview(frame)` for a zero-copy hand-off (keep the frame referenced for the

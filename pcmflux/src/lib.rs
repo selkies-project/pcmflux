@@ -1753,10 +1753,16 @@ struct RunState<'a> {
     /// is either in the history or here.
     red_spare: Vec<Vec<u8>>,
     red_distance: usize,
-    /// Whether the last frame was emitted as sound, so a header capture's gate lets the silent
-    /// frame after it through (behind the bare `WS_QUIET` mark, and marked itself), and a
+    /// Whether the last frame was emitted as sound, so the gate lets the silent frame after it
+    /// through when that frame carries the end of the sound (always on a header capture, behind
+    /// the bare `WS_QUIET` mark and marked itself; on a raw capture when `tail_sounding`), and a
     /// session that drops after it sends the bare mark once.
     sounding: bool,
+    /// Whether that frame of sound held sound in its last `lookahead` samples, the part the
+    /// encoder holds back until the next frame.
+    tail_sounding: bool,
+    /// The encoder's lookahead in samples per channel (`PcmEncoder::lookahead`).
+    lookahead: usize,
     /// A surround capture's stereo encoder and its downmix scratch, for
     /// `Inner::stereo_companion`; `None` for mono and stereo captures.
     companion: Option<(PcmEncoder, Vec<i16>)>,
@@ -1812,13 +1818,14 @@ impl<'a> RunState<'a> {
     ///    `frame_size_per_channel` — a monotonic per-frame timestamp used for RED offsets and
     ///    client-side ordering.
     /// 3. **Silence gate**: when enabled, a frame equal to the zeroed `silence_ref` is counted
-    ///    and dropped (no Opus is sent), so pure silence costs no bandwidth. On a header capture
-    ///    the first one after sound is still encoded and sent, since it carries the end of the
-    ///    sound the encoder held back (its lookahead): the bare `WS_QUIET` mark goes first, then
-    ///    that frame with `WS_QUIET` set. A raw Opus capture drops it as well: a WebRTC
-    ///    receiver's jitter buffer fades the sound after a pause in from what it concealed, and
-    ///    concealing from that frame's near-silence fades a short sound further than
-    ///    concealing from the sound. The first non-silent frame logs once.
+    ///    and dropped (no Opus is sent), so pure silence costs no bandwidth. The first one after
+    ///    sound can carry the end of that sound, the part the encoder held back (its
+    ///    lookahead). A header capture always sends it: the bare `WS_QUIET` mark goes first,
+    ///    then that frame with `WS_QUIET` set. A raw Opus capture sends it only when the sound
+    ///    reached into that lookahead (`tail_sounding`): a WebRTC receiver's jitter buffer
+    ///    fades the sound after a pause in from what it concealed, and concealing from a frame
+    ///    of silence faded more short sounds than concealing from the sound itself, while a
+    ///    frame that ends a sound loses nothing of it. The first non-silent frame logs once.
     /// 4. **Encode in place**: `write_ws_prefix_into` writes the RFC 2198 RED framing prefix
     ///    (which depends only on `pts` + history) into a pooled buffer, and the Opus packet is
     ///    encoded DIRECTLY after it — no assembly copy, and the buffer recycles through the
@@ -1857,7 +1864,7 @@ impl<'a> RunState<'a> {
         let emit_header = self.inner.emit_audio_header.load(Ordering::Relaxed);
         let silent = self.inner.use_silence_gate.load(Ordering::Relaxed)
             && self.accum == self.silence_ref;
-        if silent && !(self.sounding && emit_header) {
+        if silent && !(self.sounding && (emit_header || self.tail_sounding)) {
             self.sounding = false;
             self.chunks_silent += 1;
             // Flush the RED backlog: if these pre-silence frames were kept, the first
@@ -1899,6 +1906,8 @@ impl<'a> RunState<'a> {
             return;
         }
         self.sounding = !silent;
+        let held = self.lookahead.min(self.frame_size_per_channel) * self.channels;
+        self.tail_sounding = !silent && self.accum[n - held..n].iter().any(|&v| v != 0);
         self.chunks_encoded += 1;
         self.bytes_encoded += encoded as u64;
         if let Some(sink) = self.ogg.as_mut() {
@@ -1915,7 +1924,7 @@ impl<'a> RunState<'a> {
             self.red_history.push_back((slot, pts));
         }
         data.truncate(prefix + encoded);
-        if silent {
+        if silent && emit_header {
             self.push_mark(pts);
             data[1] |= WS_QUIET;
         }
@@ -1924,7 +1933,7 @@ impl<'a> RunState<'a> {
             self.pool.put(data);
         }
         if self.inner.stereo_companion.load(Ordering::Relaxed) {
-            self.emit_companion(pts, emit_header, silent);
+            self.emit_companion(pts, emit_header, silent && emit_header);
         }
     }
 
@@ -2296,6 +2305,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
             }
         }
     };
+    let lookahead = encoder.lookahead().max(0) as usize;
     let mut run = RunState {
         inner,
         ring: &ring,
@@ -2310,6 +2320,8 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
         red_spare: Vec::new(),
         red_distance: settings.red_distance.max(0) as usize,
         sounding: false,
+        tail_sounding: false,
+        lookahead,
         companion: if channels > 2 {
             match PcmEncoder::new(settings.sample_rate, 2, settings.use_vbr, settings.opus_bitrate) {
                 Ok(e) => Some((e, vec![0i16; frame_size_per_channel * 2])),
@@ -3381,6 +3393,8 @@ mod tests {
             red_spare: Vec::new(),
             red_distance: 0,
             sounding: false,
+            tail_sounding: false,
+            lookahead: 120,
             companion: Some((PcmEncoder::new(48000, 2, true, 256000).expect("stereo"), vec![0i16; frame * 2])),
             companion_bitrate: 256000,
             total_samples_processed: 0,
@@ -3674,7 +3688,8 @@ mod tests {
     /// `[0x01, WS_QUIET]` where the sound ends, then the first silent frame (it carries the end
     /// of the sound) with `WS_QUIET` set too, the frames after it send nothing, and sound
     /// resumes with the plain header (RED on or off, since the gate empties the history). A raw
-    /// Opus capture sends the frames of sound alone.
+    /// Opus capture sends the same frames with no marker, the silent one because the tone ran
+    /// into the encoder's lookahead.
     #[test]
     fn gated_silence_sends_one_quiet_frame() {
         for (red, header) in [(0usize, true), (2, true), (0, false)] {
@@ -3697,6 +3712,8 @@ mod tests {
                 red_spare: Vec::new(),
                 red_distance: red,
                 sounding: false,
+                tail_sounding: false,
+                lookahead: 120,
                 companion: None,
                 companion_bitrate: 64000,
                 total_samples_processed: 0,
@@ -3727,7 +3744,7 @@ mod tests {
                 assert!(frames.iter().enumerate().all(|(i, (d, _, _))| i == 2 || i == 3 || d[1] & WS_QUIET == 0));
                 assert_eq!(frames[4].0[1], 0x00, "sound resumes with the plain header");
             } else {
-                assert_eq!(pts, vec![480, 960, 2880, 3360]);
+                assert_eq!(pts, vec![480, 960, 1440, 2880, 3360]);
                 assert!(quiet_frames.is_empty() && frames.iter().all(|(d, _, _)| d.len() > 2));
             }
         }
@@ -3757,6 +3774,8 @@ mod tests {
             red_spare: Vec::new(),
             red_distance: 0,
             sounding: false,
+            tail_sounding: false,
+            lookahead: 120,
             companion: None,
             companion_bitrate: 128000,
             total_samples_processed: 0,
@@ -3795,6 +3814,75 @@ mod tests {
         assert!(peak > 8000, "the sound's tail decodes at {peak}");
     }
 
+    /// A raw capture sends the silent frame after a sound only when the sound reached into the
+    /// encoder's lookahead, the part that frame carries: a burst in the last 2 ms of a frame is
+    /// followed by the silent frame and decodes whole, and a burst that ended before the
+    /// lookahead is not followed by it.
+    #[test]
+    fn a_raw_capture_sends_the_tail_only_when_the_sound_reached_the_lookahead() {
+        for late in [true, false] {
+            let inner = Inner::new();
+            inner.emit_audio_header.store(false, Ordering::Relaxed);
+            let ring = DeliveryRing::new(64);
+            let frame = 480usize;
+            let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + MAX_OPUS_PACKET));
+            let mut run = RunState {
+                inner: &inner,
+                ring: &ring,
+                encoder: PcmEncoder::new(48000, 2, true, 128000).expect("encoder"),
+                frame_size_per_channel: frame,
+                channels: 2,
+                accum: vec![0i16; frame * 2],
+                silence_ref: vec![0i16; frame * 2],
+                pcm_fill_bytes: 0,
+                pool: PoolTaker::new(Arc::clone(&pool)),
+                red_history: VecDeque::new(),
+                red_spare: Vec::new(),
+                red_distance: 0,
+                sounding: false,
+                tail_sounding: false,
+                lookahead: 120,
+                companion: None,
+                companion_bitrate: 128000,
+                total_samples_processed: 0,
+                ogg: None,
+                ogg_scale: 1,
+                first_sound_detected: true,
+                current_applied_bitrate: 128000,
+                chunks_read: 0,
+                chunks_silent: 0,
+                chunks_encoded: 0,
+                bytes_encoded: 0,
+            };
+            let mut click = vec![0i16; frame * 2];
+            let burst = if late { frame - 96..frame } else { 96..192 };
+            for i in burst {
+                let v = ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0) as i16;
+                click[i * 2] = v;
+                click[i * 2 + 1] = v;
+            }
+            let quiet = vec![0i16; frame * 2];
+            for pcm in [&quiet, &click, &quiet, &quiet, &quiet] {
+                run.feed(bytemuck::cast_slice(pcm));
+            }
+            let queued = ring.q.lock().unwrap();
+            let frames = queued.as_ref().expect("ring open");
+            let pts: Vec<u64> = frames.iter().map(|(_, p, _)| *p).collect();
+            if !late {
+                assert_eq!(pts, vec![480], "a burst that ended before the lookahead needs no tail");
+                continue;
+            }
+            assert_eq!(pts, vec![480, 960], "the silent frame carrying the burst's end follows it");
+            let mut decoder = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
+            let mut peak = 0i32;
+            for (data, _, _) in frames {
+                let pcm: &[i16] = bytemuck::cast_slice(decoder.decode_to_pcm(data).expect("decode"));
+                peak = peak.max(pcm.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
+            }
+            assert!(peak > 8000, "the burst decodes at {peak}");
+        }
+    }
+
     /// A session that drops after sound leaves no frame to carry the mark, so a header capture
     /// sends the bare `[0x01, WS_QUIET]` once; one that drops in silence, or a raw capture,
     /// sends nothing.
@@ -3820,6 +3908,8 @@ mod tests {
                 red_spare: Vec::new(),
                 red_distance: 0,
                 sounding: false,
+                tail_sounding: false,
+                lookahead: 120,
                 companion: None,
                 companion_bitrate: 64000,
                 total_samples_processed: 0,
