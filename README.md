@@ -122,7 +122,7 @@ The example client (`index.html`) strips the 2-byte header before decoding, and 
 
 ## Ogg Opus Output Socket
 
-`output_socket` names a Unix socket the capture serves its packets on as a standard Ogg Opus stream, to every consumer that connects: the `OpusHead` and `OpusTags` pages first, then one page per packet with the 48 kHz granule position. A consumer that stops reading is dropped, never waited on.
+`output_socket` names a Unix socket the capture serves its packets on as a standard Ogg Opus stream, to every consumer that connects: the `OpusHead` and `OpusTags` pages first, then one page per packet with the 48 kHz granule position. A consumer that stops reading is dropped, never waited on. A path that cannot be bound (a missing directory, or a socket another account owns) fails the start: `start_capture` raises `RuntimeError` with the reason, which `last_error` keeps.
 
 ```python
 settings.output_socket = "/run/user/1000/audio.sock"

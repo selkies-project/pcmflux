@@ -110,15 +110,11 @@ fn header_pages(serial: u32, head: &OpusHead) -> Vec<u8> {
 }
 
 impl OggSink {
-    /// Bind the socket at `path`, or None when no path is configured or the bind fails:
-    /// the sink is optional and never takes the capture down. A file there that another
-    /// account owns is left alone and reported: in a shared directory it is that account's
+    /// Bind the socket at `path`, or say why it cannot be bound. A file there that another
+    /// account owns is left alone and refused: in a shared directory it is that account's
     /// listener, and a reader of this stream would reach it.
-    pub fn try_bind(path: &str, head: &OpusHead) -> Option<Self> {
+    pub fn bind(path: &str, head: &OpusHead) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
-        if path.is_empty() {
-            return None;
-        }
         let stale = match fs::symlink_metadata(path) {
             Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
                 Err("another account owns it".to_string())
@@ -126,17 +122,13 @@ impl OggSink {
             Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
             Err(_) => Ok(()),
         };
-        if let Err(e) = stale {
-            eprintln!("[pcmflux] ogg sink not bound on {path}: {e}");
-            return None;
-        }
-        let listener = match UnixListener::bind(path).and_then(|l| l.set_nonblocking(true).map(|_| l)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[pcmflux] ogg sink bind failed on {path}: {e}");
-                return None;
-            }
-        };
+        let listener = stale
+            .and_then(|_| {
+                UnixListener::bind(path)
+                    .and_then(|l| l.set_nonblocking(true).map(|_| l))
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| format!("output_socket {path} cannot be bound: {e}"))?;
         let serial = std::process::id() ^ (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -173,7 +165,7 @@ impl OggSink {
                 }
             }
         });
-        Some(Self { path: path.to_string(), clients, shutdown, serial, seq: 2 })
+        Ok(Self { path: path.to_string(), clients, shutdown, serial, seq: 2 })
     }
 
     /// Send one packet as a page; `granule` is the 48 kHz sample count at its end.
@@ -215,10 +207,19 @@ mod tests {
         let path = format!("/tmp/pcmflux-ogg-stale-{}.sock", std::process::id());
         fs::write(&path, b"stale").unwrap();
         let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
-        let sink = OggSink::try_bind(&path, &head);
-        assert!(sink.is_some(), "an own leftover is removed and the socket bound");
+        let sink = OggSink::bind(&path, &head);
+        assert!(sink.is_ok(), "an own leftover is removed and the socket bound");
         drop(sink);
         assert!(fs::symlink_metadata(&path).is_err(), "the socket is removed with the sink");
+    }
+
+    /// A path that cannot be bound is an error naming it, not a sink that serves nobody.
+    #[test]
+    fn an_unbindable_path_is_an_error() {
+        let path = format!("/tmp/pcmflux-ogg-missing-{}/rec.sock", std::process::id());
+        let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
+        let err = OggSink::bind(&path, &head).err().expect("a missing directory is refused");
+        assert!(err.contains(&path), "{err}");
     }
 
     /// A consumer that connects reads the two header pages and then every packet page, each
@@ -231,7 +232,7 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0x89a1_897f);
         let path = format!("/tmp/pcmflux-ogg-test-{}.sock", std::process::id());
         let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
-        let mut sink = OggSink::try_bind(&path, &head).expect("bind");
+        let mut sink = OggSink::bind(&path, &head).expect("bind");
         let mut consumer = UnixStream::connect(&path).expect("connect");
         consumer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         thread::sleep(Duration::from_millis(150));

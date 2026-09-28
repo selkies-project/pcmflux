@@ -462,7 +462,8 @@ struct AudioCaptureSettings {
     #[pyo3(get, set)]
     red_distance: i32,
     /// Unix socket path on which the capture serves its packets as an Ogg Opus stream to
-    /// every consumer that connects; empty serves none.
+    /// every consumer that connects; empty serves none. A path that cannot be bound fails the
+    /// start like any other startup error.
     #[pyo3(get, set)]
     output_socket: String,
 }
@@ -2258,13 +2259,23 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
 
     let ogg_scale = 48_000 / settings.sample_rate.max(1) as u64;
     let mut encoder = encoder;
-    let ogg = ogg_sink::OggSink::try_bind(&settings.output_socket, &ogg_sink::OpusHead {
-        channels: channels as u8,
-        pre_skip: (encoder.lookahead().max(0) as u64 * ogg_scale).min(u16::MAX as u64) as u16,
-        input_sample_rate: settings.sample_rate,
-        mapping: multiopus_layout(channels as i32)
-            .map(|(streams, coupled, table)| (streams as u8, coupled as u8, table.to_vec())),
-    });
+    let ogg = if settings.output_socket.is_empty() {
+        None
+    } else {
+        match ogg_sink::OggSink::bind(&settings.output_socket, &ogg_sink::OpusHead {
+            channels: channels as u8,
+            pre_skip: (encoder.lookahead().max(0) as u64 * ogg_scale).min(u16::MAX as u64) as u16,
+            input_sample_rate: settings.sample_rate,
+            mapping: multiopus_layout(channels as i32)
+                .map(|(streams, coupled, table)| (streams as u8, coupled as u8, table.to_vec())),
+        }) {
+            Ok(sink) => Some(sink),
+            Err(e) => {
+                inner.fail(e);
+                return;
+            }
+        }
+    };
     let mut run = RunState {
         inner,
         ring: &ring,
