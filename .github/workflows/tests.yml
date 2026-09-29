@@ -42,10 +42,15 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
 
       - name: cargo test
         # No sound server runs on a runner; the tests that need one are ignored.
         run: cargo test --manifest-path pcmflux/Cargo.toml
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path pcmflux/Cargo.toml --all-targets -- -D warnings
 
   pre-commit:
     name: pre-commit
@@ -59,6 +64,9 @@ jobs:
           components: rustfmt
 
       - name: pre-commit
+        # clippy builds the crate, which the cargo jobs do
+        env:
+          SKIP: clippy
         run: |
           python3 -m pip install "pre-commit==4.6.*"
           pre-commit run --all-files --show-diff-on-failure

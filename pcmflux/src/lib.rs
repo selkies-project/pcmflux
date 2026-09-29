@@ -1340,7 +1340,7 @@ fn surround_channel_map(channels: i32) -> Option<&'static str> {
 /// surround stream sounds.
 fn downmix_stereo(src: &[i16], channels: usize, dst: &mut [i16]) {
     const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    for (f, out) in dst.chunks_exact_mut(2).enumerate() {
+    for (f, out) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let s = &src[f * channels..(f + 1) * channels];
         let center = K * s[2] as f32;
         let mut left = s[0] as f32 + center + K * s[4] as f32;

@@ -1,11 +1,13 @@
-# The formatting check CI runs, moved ahead of the commit. One-time setup:
+# The formatting and lint checks CI runs, moved ahead of the commit. One-time
+# setup:
 #
 #     pip install pre-commit
 #     pre-commit install
 #
 # Run over the whole tree at any time with `pre-commit run --all-files`. rustfmt
-# comes with the Rust toolchain (`rustup component add rustfmt`) and reads
-# rustfmt.toml.
+# and clippy come with the Rust toolchain (`rustup component add rustfmt
+# clippy`); rustfmt reads rustfmt.toml, and clippy builds the crate, so it needs
+# the native libraries a test build does.
 repos:
   - repo: local
     hooks:
@@ -14,3 +16,9 @@ repos:
         entry: rustfmt
         language: system
         types: [rust]
+      - id: clippy
+        name: clippy
+        entry: cargo clippy --manifest-path pcmflux/Cargo.toml --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

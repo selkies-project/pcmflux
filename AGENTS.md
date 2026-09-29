@@ -14,8 +14,8 @@ to an LLM bot or developer. Write American English -- color, behavior, center, i
 where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
 Empirical testing is possible for everything here, including implementation, auditing, validation, and verification,
-and every change is validated before it is reported. `cargo test --lib` and `pre-commit run --all-files` (rustfmt)
-are the floor, and
+and every change is validated before it is reported. `cargo test --lib` and `pre-commit run --all-files`
+(rustfmt and clippy) are the floor, and
 `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement to quote rather
 than assert. The test binary links the interpreter because pyo3's `extension-module` is a crate feature the Python
 build alone asks for (`features` on the `RustExtension` in `setup.py`); putting it back on the pyo3 dependency itself
