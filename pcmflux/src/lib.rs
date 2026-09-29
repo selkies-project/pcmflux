@@ -292,6 +292,7 @@ struct Settings {
     opus_bitrate: i32,
     frame_duration_ms: f64,
     use_vbr: bool,
+    opus_complexity: Option<i32>,
     use_silence_gate: bool,
     debug_logging: bool,
     latency_ms: i32,
@@ -299,6 +300,9 @@ struct Settings {
     red_distance: i32,
     output_socket: String,
 }
+
+/// Highest Opus encoder complexity.
+const OPUS_COMPLEXITY_MAX: i32 = 10;
 
 /// True if `ms` is a valid Opus frame duration (2.5, 5, 10, 20, 40, or 60 ms).
 ///
@@ -352,6 +356,7 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
             .clamp(OPUS_BITRATE_MIN, OPUS_BITRATE_MAX),
         frame_duration_ms: s.getattr("frame_duration_ms")?.extract()?,
         use_vbr: s.getattr("use_vbr")?.extract()?,
+        opus_complexity: s.getattr("opus_complexity")?.extract()?,
         use_silence_gate: s.getattr("use_silence_gate")?.extract()?,
         debug_logging: s.getattr("debug_logging")?.extract()?,
         latency_ms: s.getattr("latency_ms")?.extract()?,
@@ -367,6 +372,13 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         return value_error(format!(
             "frame_duration_ms must be one of 2.5, 5, 10, 20, 40, or 60 (got {})",
             parsed.frame_duration_ms
+        ));
+    }
+    if let Some(c) = parsed.opus_complexity
+        && !(0..=OPUS_COMPLEXITY_MAX).contains(&c)
+    {
+        return value_error(format!(
+            "opus_complexity must be None or between 0 and {OPUS_COMPLEXITY_MAX} (got {c})"
         ));
     }
     if !matches!(parsed.channels, 1 | 2 | 6 | 8) {
@@ -467,6 +479,11 @@ struct AudioCaptureSettings {
     frame_duration_ms: f64,
     #[pyo3(get, set)]
     use_vbr: bool,
+    /// Opus encoder complexity, 0 (cheapest) to 10; out-of-range values raise `ValueError` at
+    /// start. `None` leaves the encoder at libopus's default. Applied when the encoder is
+    /// created, so it does not change during a running capture.
+    #[pyo3(get, set)]
+    opus_complexity: Option<i32>,
     #[pyo3(get, set)]
     use_silence_gate: bool,
     #[pyo3(get, set)]
@@ -495,6 +512,7 @@ impl AudioCaptureSettings {
             opus_bitrate: 128000,
             frame_duration_ms: 20.0,
             use_vbr: true,
+            opus_complexity: None,
             use_silence_gate: true,
             debug_logging: false,
             latency_ms: 0,
@@ -1402,8 +1420,15 @@ impl PcmEncoder {
     /// - **Surround** (6/8): the raw multistream C encoder created from `multiopus_layout`
     ///   in `RESTRICTED_LOWDELAY`; an unsupported channel count is a hard error.
     ///
-    /// Bitrate and VBR are applied at creation and can be retuned live via `set_bitrate`.
-    fn new(sample_rate: u32, channels: i32, vbr: bool, bitrate: i32) -> Result<Self, String> {
+    /// Bitrate, VBR, and a `Some` complexity are applied at creation; `None` sends no complexity
+    /// request, leaving libopus's default. Bitrate can be retuned live via `set_bitrate`.
+    fn new(
+        sample_rate: u32,
+        channels: i32,
+        vbr: bool,
+        bitrate: i32,
+        complexity: Option<i32>,
+    ) -> Result<Self, String> {
         if channels <= 2 {
             let mut err = 0;
             let st = unsafe {
@@ -1431,6 +1456,12 @@ impl PcmEncoder {
                 ) != 0
                 {
                     elog!("[pcmflux] WARNING: failed to apply VBR mode");
+                }
+                if let Some(c) = complexity
+                    && opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_COMPLEXITY_REQUEST, c)
+                        != 0
+                {
+                    elog!("[pcmflux] WARNING: failed to apply complexity");
                 }
             }
             return Ok(PcmEncoder::Stereo(enc));
@@ -1466,6 +1497,15 @@ impl PcmEncoder {
             ) != 0
             {
                 elog!("[pcmflux] WARNING: failed to apply surround VBR mode");
+            }
+            if let Some(c) = complexity
+                && opusic_sys::opus_multistream_encoder_ctl(
+                    st,
+                    opusic_sys::OPUS_SET_COMPLEXITY_REQUEST,
+                    c,
+                ) != 0
+            {
+                elog!("[pcmflux] WARNING: failed to apply surround complexity");
             }
             Ok(PcmEncoder::Multi(MultiOpus { st }))
         }
@@ -2274,6 +2314,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
         settings.channels,
         settings.use_vbr,
         settings.opus_bitrate,
+        settings.opus_complexity,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -2398,6 +2439,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                 2,
                 settings.use_vbr,
                 settings.opus_bitrate,
+                settings.opus_complexity,
             ) {
                 Ok(e) => Some((e, vec![0i16; frame_size_per_channel * 2])),
                 Err(e) => {
@@ -3414,6 +3456,70 @@ mod tests {
         );
     }
 
+    /// Encode the same noisy PCM with `complexity` and return the concatenated packets.
+    fn encode_noise(channels: i32, complexity: Option<i32>) -> Vec<u8> {
+        let ch = channels as usize;
+        let frame = 960usize;
+        let mut enc = PcmEncoder::new(48000, channels, true, 96000, complexity).expect("encoder");
+        let mut seed = 0x2545_f491u32;
+        let mut bytes = Vec::new();
+        for _ in 0..8 {
+            let pcm: Vec<i16> = (0..frame * ch)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((seed >> 16) as i16) / 4
+                })
+                .collect();
+            let mut out = vec![0u8; 4 * MAX_OPUS_PACKET];
+            let n = enc.encode(&pcm, frame, &mut out).expect("encode");
+            bytes.extend_from_slice(&out[..n]);
+        }
+        bytes
+    }
+
+    /// The complexity reaches both encoder APIs: 0 and 10 produce different packets from the
+    /// same input, and leaving it unset produces exactly what libopus's default of 9 does, so
+    /// the default sends no request.
+    #[test]
+    fn opus_complexity_reaches_the_encoder() {
+        for channels in [2, 6] {
+            let low = encode_noise(channels, Some(0));
+            let high = encode_noise(channels, Some(10));
+            assert_ne!(
+                low, high,
+                "complexity 0 and 10 encoded identically ({channels} ch)"
+            );
+            assert_eq!(
+                encode_noise(channels, None),
+                encode_noise(channels, Some(9))
+            );
+        }
+    }
+
+    /// `opus_complexity` is `None` by default, accepts 0 through 10, and rejects anything
+    /// else with `ValueError`.
+    #[test]
+    fn opus_complexity_is_validated() {
+        Python::initialize();
+        Python::attach(|py| {
+            let settings = Bound::new(py, AudioCaptureSettings::new(py)).unwrap();
+            let settings = settings.as_any();
+            assert_eq!(extract_settings(settings).unwrap().opus_complexity, None);
+            for ok in [0, 5, 10] {
+                settings.setattr("opus_complexity", ok).unwrap();
+                assert_eq!(
+                    extract_settings(settings).unwrap().opus_complexity,
+                    Some(ok)
+                );
+            }
+            for bad in [-1, 11] {
+                settings.setattr("opus_complexity", bad).unwrap();
+                let err = extract_settings(settings).err().expect("out of range");
+                assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            }
+        });
+    }
+
     /// Encode 5.1 with a tone only on FC (input channel 2), decode with the same
     /// layout, and verify the energy comes back on that same channel — proving the
     /// `multiopus_layout` tables are self-consistent end to end.
@@ -3421,7 +3527,7 @@ mod tests {
     fn multiopus_surround_roundtrip() {
         let channels = 6usize;
         let frame = 480usize;
-        let mut enc = PcmEncoder::new(48000, channels as i32, true, 256000).expect("encoder");
+        let mut enc = PcmEncoder::new(48000, channels as i32, true, 256000, None).expect("encoder");
         let mut pcm = vec![0i16; frame * channels];
         for i in 0..frame {
             let v =
@@ -3514,7 +3620,7 @@ mod tests {
         let mut run = RunState {
             inner: &inner,
             ring: &ring,
-            encoder: PcmEncoder::new(48000, 6, true, 256000).expect("encoder"),
+            encoder: PcmEncoder::new(48000, 6, true, 256000, None).expect("encoder"),
             frame_size_per_channel: frame,
             channels: 6,
             accum: vec![0i16; frame * 6],
@@ -3528,7 +3634,7 @@ mod tests {
             tail_sounding: false,
             lookahead: 120,
             companion: Some((
-                PcmEncoder::new(48000, 2, true, 256000).expect("stereo"),
+                PcmEncoder::new(48000, 2, true, 256000, None).expect("stereo"),
                 vec![0i16; frame * 2],
             )),
             companion_bitrate: 256000,
@@ -3757,7 +3863,7 @@ mod tests {
     /// Test helper: `n` distinct valid 20 ms mono Opus packets at 24 kHz
     /// (480 samples/frame).
     fn opus_frames(n: usize) -> Vec<Vec<u8>> {
-        let mut enc = PcmEncoder::new(24000, 1, true, 24000).unwrap();
+        let mut enc = PcmEncoder::new(24000, 1, true, 24000, None).unwrap();
         (0..n)
             .map(|s| {
                 let pcm: Vec<i16> = (0..480)
@@ -3888,7 +3994,7 @@ mod tests {
             let mut run = RunState {
                 inner: &inner,
                 ring: &ring,
-                encoder: PcmEncoder::new(48000, 2, true, 64000).expect("encoder"),
+                encoder: PcmEncoder::new(48000, 2, true, 64000, None).expect("encoder"),
                 frame_size_per_channel: frame,
                 channels: 2,
                 accum: vec![0i16; frame * 2],
@@ -3967,7 +4073,7 @@ mod tests {
         let mut run = RunState {
             inner: &inner,
             ring: &ring,
-            encoder: PcmEncoder::new(48000, 2, true, 128000).expect("encoder"),
+            encoder: PcmEncoder::new(48000, 2, true, 128000, None).expect("encoder"),
             frame_size_per_channel: frame,
             channels: 2,
             accum: vec![0i16; frame * 2],
@@ -4044,7 +4150,7 @@ mod tests {
             let mut run = RunState {
                 inner: &inner,
                 ring: &ring,
-                encoder: PcmEncoder::new(48000, 2, true, 128000).expect("encoder"),
+                encoder: PcmEncoder::new(48000, 2, true, 128000, None).expect("encoder"),
                 frame_size_per_channel: frame,
                 channels: 2,
                 accum: vec![0i16; frame * 2],
@@ -4122,7 +4228,7 @@ mod tests {
             let mut run = RunState {
                 inner: &inner,
                 ring: &ring,
-                encoder: PcmEncoder::new(48000, 2, true, 64000).expect("encoder"),
+                encoder: PcmEncoder::new(48000, 2, true, 64000, None).expect("encoder"),
                 frame_size_per_channel: frame,
                 channels: 2,
                 accum: vec![0i16; frame * 2],

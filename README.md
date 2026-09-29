@@ -35,7 +35,7 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 - **Native Audio Header:** With `omit_audio_header=False` (the default), the encoder prepends a 2-byte `[0x01, 0x00]` header to each chunk natively, so WebSocket transports avoid an extra Python copy. When the silence gate closes after sound, a single two-byte `[0x01, 0x80]` chunk with no Opus marks where the sound ends (as it does when the sound server drops the capture), so a player plays out what it holds instead of waiting for more and can tell the sender's silence from a late delivery; the first silent chunk follows it with the same bit set, since its Opus carries the end of the sound the encoder held back, and a player appends it to that sound. Below that bit, the second byte is the RED block count. Set it to `True` for raw Opus (WebRTC/RTP).
 - **Optional RED redundancy (RFC 2198):** `red_distance` (0–4, default 0) prepends redundant copies of recent Opus payloads for lossy/unreliable transports; `0` disables it (the default for reliable WebSocket/TCP).
 - **Zero-copy Frames:** Each callback receives a native `AudioFrame` that owns the encoded chunk and supports the buffer protocol — `bytes(frame)` / `memoryview(frame)` / `len(frame)` — on **every supported Python version (3.9 and newer)**. `memoryview(frame)` aliases the buffer with no copy, and the frame keeps it alive until every view is released, so the hand-off is memory-safe.
-- **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, and a toggleable silence gate.
+- **Tunable Capture:** Configurable `latency_ms`, validated `frame_duration_ms` (2.5/5/10/20/40/60 ms, default 20), VBR/CBR, an optional `opus_complexity` (0–10; unset leaves libopus's default of 9), and a toggleable silence gate.
 - **Multichannel Opus:** Mono, stereo, and 5.1 / 7.1 surround (via the Opus multistream API with Chromium-compatible channel layouts); `channels` accepts 1, 2, 6, or 8. A surround capture asks the sound server for the speaker positions its encoder reads (front left, right, and center, LFE, the rear pair, and at 7.1 the side pair), so a source of any layout is remixed into them, and `set_stereo_companion(True)` has it also deliver every frame folded to stereo (ITU-R BS.775, LFE left out) for consumers that decode no multistream Opus: each companion frame follows its surround frame with the same `pts` and `frame.channels == 2`.
 - **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo, and `write` / `write_red` take any bytes-like object (`bytes`, `memoryview`, `bytearray`, ...). Queued audio that stays unplayed through a whole second (after a burst, a stalled client, a sink that resumed late, or a client clock running fast of the sink's) is cut from the head of the queue with a 2 ms crossfade, so the uplink's delay returns to the sink's own buffer (`latency_ms`) instead of standing up to `max_buffer_bytes`.
 - **Live Bitrate Updates:** Thread-safe `update_audio_bitrate()` adjusts the Opus bitrate during an active session.
@@ -77,6 +77,7 @@ def on_chunk(frame):
 settings = AudioCaptureSettings()
 settings.device_name = None      # None / "" => system default source
 settings.frame_duration_ms = 20  # one of 2.5/5/10/20/40/60
+settings.opus_complexity = 5     # 0-10, lower spends less encoder CPU; None keeps the default
 
 capture = AudioCapture()
 capture.start_capture(settings, on_chunk)
@@ -88,8 +89,8 @@ capture.stop_capture()
 ### API notes
 
 - `start_capture()` raises `ValueError` for settings the encoder or PulseAudio
-  could never accept (sample rate, channel count, frame duration, negative
-  latency, a NUL in `device_name`) and `RuntimeError` when the capture thread
+  could never accept (sample rate, channel count, frame duration, an
+  `opus_complexity` outside 0–10, negative latency, a NUL in `device_name`) and `RuntimeError` when the capture thread
   fails within the ~2 s start handshake. A PulseAudio server (or the named
   source) that is still coming up is retried with backoff for longer than
   that — `start_capture()` then returns with `state == "starting"`, and the
