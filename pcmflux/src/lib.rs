@@ -41,7 +41,9 @@ use pyo3::buffer::PyUntypedBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -51,11 +53,10 @@ use pulse::callbacks::ListResult;
 use pulse::channelmap::Map as ChannelMap;
 use pulse::context::{Context, FlagSet as CtxFlags};
 use pulse::def::BufferAttr;
-use pulse::sample::{Format, Spec};
 use pulse::mainloop::standard::Mainloop;
+use pulse::sample::{Format, Spec};
 use pulse::stream::{FlagSet as StreamFlags, PeekResult, Stream};
 use pulse::time::MicroSeconds;
-
 
 /// Non-panicking `println!` replacement that swallows write errors (e.g. EPIPE) instead
 /// of panicking, so a broken output pipe can't unwind the capture thread or a callback.
@@ -355,7 +356,10 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         debug_logging: s.getattr("debug_logging")?.extract()?,
         latency_ms: s.getattr("latency_ms")?.extract()?,
         omit_audio_header: s.getattr("omit_audio_header")?.extract()?,
-        red_distance: s.getattr("red_distance")?.extract::<i32>()?.clamp(0, RED_MAX_DISTANCE),
+        red_distance: s
+            .getattr("red_distance")?
+            .extract::<i32>()?
+            .clamp(0, RED_MAX_DISTANCE),
         output_socket: s.getattr("output_socket")?.extract()?,
     };
     check_opus_sample_rate(parsed.sample_rate)?;
@@ -366,7 +370,10 @@ fn extract_settings(s: &Bound<'_, PyAny>) -> PyResult<Settings> {
         ));
     }
     if !matches!(parsed.channels, 1 | 2 | 6 | 8) {
-        return value_error(format!("channels must be 1, 2, 6, or 8 (got {})", parsed.channels));
+        return value_error(format!(
+            "channels must be 1, 2, 6, or 8 (got {})",
+            parsed.channels
+        ));
     }
     if parsed.latency_ms < 0 {
         return value_error(format!(
@@ -424,10 +431,16 @@ fn extract_pb_settings(s: &Bound<'_, PyAny>) -> PyResult<PbSettings> {
     };
     check_opus_sample_rate(parsed.sample_rate)?;
     if !matches!(parsed.channels, 1 | 2) {
-        return value_error(format!("playback channels must be 1 or 2 (got {})", parsed.channels));
+        return value_error(format!(
+            "playback channels must be 1 or 2 (got {})",
+            parsed.channels
+        ));
     }
     if parsed.latency_ms <= 0 {
-        return value_error(format!("latency_ms must be > 0 (got {})", parsed.latency_ms));
+        return value_error(format!(
+            "latency_ms must be > 0 (got {})",
+            parsed.latency_ms
+        ));
     }
     if parsed.max_buffer_bytes == 0 {
         return value_error("max_buffer_bytes must be > 0 (got 0)".to_string());
@@ -675,9 +688,9 @@ impl Inner {
     /// Only transitions `STOP_NONE -> me` via compare-exchange, so it never overwrites a
     /// pending external stop (which must win the join).
     fn request_self_stop(&self, me: i64) {
-        let _ = self
-            .stop_state
-            .compare_exchange(STOP_NONE, me, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.stop_state
+                .compare_exchange(STOP_NONE, me, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Undo a re-entrant self-stop (self-start from inside the callback).
@@ -686,9 +699,9 @@ impl Inner {
     /// still owns it. If an external stop landed in between, the CAS fails and that stop
     /// stands.
     fn undo_self_stop(&self, me: i64) {
-        let _ = self
-            .stop_state
-            .compare_exchange(me, STOP_NONE, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.stop_state
+                .compare_exchange(me, STOP_NONE, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Clear the stop state back to running. Only ever called under the lifecycle
@@ -747,7 +760,10 @@ impl Inner {
     /// The message of the last run's failure, or `None` while no run has failed since the
     /// last (re)start.
     fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Forget the previous run's failure; called by `spawn_worker` as a new run is armed.
@@ -830,24 +846,26 @@ fn spawn_worker(
     inner.started_ok.store(false, Ordering::Release);
     inner.start_state.store(ST_STARTING, Ordering::Release);
     let t_inner = inner.clone();
-    match std::thread::Builder::new().name(name.into()).spawn(move || {
-        unsafe {
-            let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -15);
-        }
-        t_inner.capture_tid.store(gettid(), Ordering::Release);
-        // A worker panic must flip the liveness contract (started_ok/start_state):
-        // an unguarded unwind would leave is_capturing reporting true forever with
-        // no frames flowing and no error anywhere.
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-            let what = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic payload".to_string());
-            t_inner.fail(format!("worker thread panicked: {what}"));
-        }
-        t_inner.capture_tid.store(0, Ordering::Release);
-    }) {
+    match std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            unsafe {
+                let _ = libc::setpriority(libc::PRIO_PROCESS, gettid() as libc::id_t, -15);
+            }
+            t_inner.capture_tid.store(gettid(), Ordering::Release);
+            // A worker panic must flip the liveness contract (started_ok/start_state):
+            // an unguarded unwind would leave is_capturing reporting true forever with
+            // no frames flowing and no error anywhere.
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                t_inner.fail(format!("worker thread panicked: {what}"));
+            }
+            t_inner.capture_tid.store(0, Ordering::Release);
+        }) {
         Ok(h) => {
             let id = h.thread().id();
             *guard = Some(h);
@@ -900,7 +918,9 @@ fn await_start(
     }
     if state == ST_FAILED {
         py.detach(|| join_failed_start(slot, inner, spawned));
-        let why = inner.last_error().unwrap_or_else(|| "unknown error".to_string());
+        let why = inner
+            .last_error()
+            .unwrap_or_else(|| "unknown error".to_string());
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{what} failed to start: {why}"
         )));
@@ -939,7 +959,8 @@ impl PlayQueue {
     fn configure(&self, max_bytes: usize, frame_bytes: usize) {
         let fb = frame_bytes.max(1);
         self.frame_bytes.store(fb, Ordering::Relaxed);
-        self.max_bytes.store((max_bytes / fb * fb).max(fb), Ordering::Relaxed);
+        self.max_bytes
+            .store((max_bytes / fb * fb).max(fb), Ordering::Relaxed);
         self.clear();
     }
 
@@ -1216,9 +1237,10 @@ impl OpusPlaybackDecoder {
         if self.last_ts.is_none() {
             let (ts, start, len) = frames[nf - 1];
             if len > 0
-                && let Some(pcm) = self.decode_to_pcm(&payload[start..start + len]) {
-                    queue.push(pcm);
-                }
+                && let Some(pcm) = self.decode_to_pcm(&payload[start..start + len])
+            {
+                queue.push(pcm);
+            }
             self.last_ts = Some(ts);
             return;
         }
@@ -1304,7 +1326,9 @@ fn multiopus_layout(channels: i32) -> Option<(i32, i32, &'static [u8])> {
 fn surround_channel_map(channels: i32) -> Option<&'static str> {
     match channels {
         6 => Some("front-left,front-right,front-center,lfe,rear-left,rear-right"),
-        8 => Some("front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right"),
+        8 => Some(
+            "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
+        ),
         _ => None,
     }
 }
@@ -1395,10 +1419,17 @@ impl PcmEncoder {
             }
             let enc = MonoOpus { st };
             unsafe {
-                if opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_BITRATE_REQUEST, bitrate) != 0 {
+                if opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_BITRATE_REQUEST, bitrate)
+                    != 0
+                {
                     elog!("[pcmflux] WARNING: failed to apply initial bitrate");
                 }
-                if opusic_sys::opus_encoder_ctl(st, opusic_sys::OPUS_SET_VBR_REQUEST, i32::from(vbr)) != 0 {
+                if opusic_sys::opus_encoder_ctl(
+                    st,
+                    opusic_sys::OPUS_SET_VBR_REQUEST,
+                    i32::from(vbr),
+                ) != 0
+                {
                     elog!("[pcmflux] WARNING: failed to apply VBR mode");
                 }
             }
@@ -1510,7 +1541,11 @@ impl PcmEncoder {
     fn set_bitrate(&mut self, bits: i32) -> Result<(), String> {
         match self {
             PcmEncoder::Stereo(enc) => unsafe {
-                let ret = opusic_sys::opus_encoder_ctl(enc.st, opusic_sys::OPUS_SET_BITRATE_REQUEST, bits);
+                let ret = opusic_sys::opus_encoder_ctl(
+                    enc.st,
+                    opusic_sys::OPUS_SET_BITRATE_REQUEST,
+                    bits,
+                );
                 if ret != 0 {
                     Err(format!("ctl error {ret}"))
                 } else {
@@ -1644,7 +1679,10 @@ impl BufferPool {
 
     /// Create an empty pool that hands out (and accepts) `buf_size`-byte buffers.
     fn new(buf_size: usize) -> Self {
-        Self { bufs: Mutex::new(Vec::new()), buf_size }
+        Self {
+            bufs: Mutex::new(Vec::new()),
+            buf_size,
+        }
     }
 
     /// Take a fully initialized buffer of exactly `buf_size` length, recycling a
@@ -1703,7 +1741,10 @@ struct PoolTaker {
 impl PoolTaker {
     /// Wrap a shared pool with an empty local stash.
     fn new(pool: Arc<BufferPool>) -> Self {
-        Self { pool, local: Vec::new() }
+        Self {
+            pool,
+            local: Vec::new(),
+        }
     }
 
     /// Take one `buf_size` buffer: pop from the local stash, batch-refilling it from
@@ -1796,8 +1837,7 @@ impl<'a> RunState<'a> {
             let take = want.min(src.len());
             {
                 let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut self.accum);
-                dst[self.pcm_fill_bytes..self.pcm_fill_bytes + take]
-                    .copy_from_slice(&src[..take]);
+                dst[self.pcm_fill_bytes..self.pcm_fill_bytes + take].copy_from_slice(&src[..take]);
             }
             self.pcm_fill_bytes += take;
             src = &src[take..];
@@ -1862,8 +1902,8 @@ impl<'a> RunState<'a> {
         self.total_samples_processed += self.frame_size_per_channel as u64;
 
         let emit_header = self.inner.emit_audio_header.load(Ordering::Relaxed);
-        let silent = self.inner.use_silence_gate.load(Ordering::Relaxed)
-            && self.accum == self.silence_ref;
+        let silent =
+            self.inner.use_silence_gate.load(Ordering::Relaxed) && self.accum == self.silence_ref;
         if silent && !(self.sounding && (emit_header || self.tail_sounding)) {
             self.sounding = false;
             self.chunks_silent += 1;
@@ -1911,11 +1951,17 @@ impl<'a> RunState<'a> {
         self.chunks_encoded += 1;
         self.bytes_encoded += encoded as u64;
         if let Some(sink) = self.ogg.as_mut() {
-            sink.write_packet(&data[prefix..prefix + encoded], self.total_samples_processed * self.ogg_scale);
+            sink.write_packet(
+                &data[prefix..prefix + encoded],
+                self.total_samples_processed * self.ogg_scale,
+            );
         }
         if self.red_distance > 0 {
             let mut slot = if self.red_history.len() >= self.red_distance {
-                self.red_history.pop_front().map(|(v, _)| v).unwrap_or_default()
+                self.red_history
+                    .pop_front()
+                    .map(|(v, _)| v)
+                    .unwrap_or_default()
             } else {
                 self.red_spare.pop().unwrap_or_default()
             };
@@ -1943,7 +1989,9 @@ impl<'a> RunState<'a> {
     /// it holds rather than waiting for more. A raw Opus capture has nothing to frame it with,
     /// and its RTP timestamps carry the pause already.
     fn emit_quiet(&mut self, pts: u64) {
-        if std::mem::take(&mut self.sounding) && self.inner.emit_audio_header.load(Ordering::Relaxed) {
+        if std::mem::take(&mut self.sounding)
+            && self.inner.emit_audio_header.load(Ordering::Relaxed)
+        {
             self.push_mark(pts);
         }
     }
@@ -2104,15 +2152,17 @@ fn pa_capture_session_open(
     if let Some(dev) = device {
         let probe = Arc::new(Mutex::new((false, false)));
         let p2 = probe.clone();
-        let op = context.introspect().get_source_info_by_name(dev, move |res| {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut g = p2.lock().unwrap_or_else(|e| e.into_inner());
-                match res {
-                    ListResult::Item(_) => g.0 = true,
-                    ListResult::End | ListResult::Error => g.1 = true,
-                }
-            }));
-        });
+        let op = context
+            .introspect()
+            .get_source_info_by_name(dev, move |res| {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut g = p2.lock().unwrap_or_else(|e| e.into_inner());
+                    match res {
+                        ListResult::Item(_) => g.0 = true,
+                        ListResult::End | ListResult::Error => g.1 = true,
+                    }
+                }));
+            });
         loop {
             if probe.lock().unwrap_or_else(|e| e.into_inner()).1 {
                 break;
@@ -2143,7 +2193,8 @@ fn pa_capture_session_open(
         }
     }
 
-    let map = surround_channel_map(spec.channels as i32).and_then(|m| ChannelMap::new_from_string(m).ok());
+    let map = surround_channel_map(spec.channels as i32)
+        .and_then(|m| ChannelMap::new_from_string(m).ok());
     let mut stream = match Stream::new(&mut context, "Audio Capture", spec, map.as_ref()) {
         Some(s) => s,
         None => return Err(tr("pa_stream_new() failed")),
@@ -2182,10 +2233,18 @@ fn pa_capture_session_open(
 }
 
 fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyAny>>) {
-    inner.opus_bitrate.store(settings.opus_bitrate, Ordering::Relaxed);
-    inner.use_silence_gate.store(settings.use_silence_gate, Ordering::Relaxed);
-    inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
-    inner.emit_audio_header.store(!settings.omit_audio_header, Ordering::Relaxed);
+    inner
+        .opus_bitrate
+        .store(settings.opus_bitrate, Ordering::Relaxed);
+    inner
+        .use_silence_gate
+        .store(settings.use_silence_gate, Ordering::Relaxed);
+    inner
+        .debug_logging
+        .store(settings.debug_logging, Ordering::Relaxed);
+    inner
+        .emit_audio_header
+        .store(!settings.omit_audio_header, Ordering::Relaxed);
 
     // Sample rate, channel count, and frame duration were validated by `extract_settings`.
     let spec = Spec {
@@ -2203,8 +2262,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     };
     let adjust_latency = settings.latency_ms > 0;
     if adjust_latency {
-        attr.fragsize =
-            spec.usec_to_bytes(MicroSeconds(settings.latency_ms as u64 * 1000)) as u32;
+        attr.fragsize = spec.usec_to_bytes(MicroSeconds(settings.latency_ms as u64 * 1000)) as u32;
     } else {
         attr.fragsize = spec.usec_to_bytes(MicroSeconds(20 * 1000)) as u32;
     }
@@ -2223,7 +2281,10 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
             return;
         }
     };
-    plog!("[pcmflux] SUCCESS: Opus encoder created ({} ch).", settings.channels);
+    plog!(
+        "[pcmflux] SUCCESS: Opus encoder created ({} ch).",
+        settings.channels
+    );
 
     let frame_size_per_channel =
         (settings.sample_rate as f64 * settings.frame_duration_ms / 1000.0) as usize;
@@ -2232,8 +2293,7 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     let ring = Arc::new(DeliveryRing::new(8));
     // Surround encodes one self-delimited packet per multistream stream (4 for 5.1, 5 for
     // 7.1), so the worst-case body scales with the stream count of the actual layout.
-    let max_pkt = multiopus_layout(settings.channels)
-        .map_or(1, |(streams, _, _)| streams as usize)
+    let max_pkt = multiopus_layout(settings.channels).map_or(1, |(streams, _, _)| streams as usize)
         * MAX_OPUS_PACKET;
     let pool = Arc::new(BufferPool::new(RED_PREFIX_MAX + max_pkt));
     let delivery = match callback {
@@ -2257,7 +2317,12 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                         Python::attach(|py| {
                             let frame = match Py::new(
                                 py,
-                                AudioFrame { data, pts, channels, pool: Some(Arc::clone(&deliver_pool)) },
+                                AudioFrame {
+                                    data,
+                                    pts,
+                                    channels,
+                                    pool: Some(Arc::clone(&deliver_pool)),
+                                },
                             ) {
                                 Ok(f) => f,
                                 Err(e) => {
@@ -2291,13 +2356,18 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     let ogg = if settings.output_socket.is_empty() {
         None
     } else {
-        match ogg_sink::OggSink::bind(&settings.output_socket, &ogg_sink::OpusHead {
-            channels: channels as u8,
-            pre_skip: (encoder.lookahead().max(0) as u64 * ogg_scale).min(u16::MAX as u64) as u16,
-            input_sample_rate: settings.sample_rate,
-            mapping: multiopus_layout(channels as i32)
-                .map(|(streams, coupled, table)| (streams as u8, coupled as u8, table.to_vec())),
-        }) {
+        match ogg_sink::OggSink::bind(
+            &settings.output_socket,
+            &ogg_sink::OpusHead {
+                channels: channels as u8,
+                pre_skip: (encoder.lookahead().max(0) as u64 * ogg_scale).min(u16::MAX as u64)
+                    as u16,
+                input_sample_rate: settings.sample_rate,
+                mapping: multiopus_layout(channels as i32).map(|(streams, coupled, table)| {
+                    (streams as u8, coupled as u8, table.to_vec())
+                }),
+            },
+        ) {
             Ok(sink) => Some(sink),
             Err(e) => {
                 inner.fail(e);
@@ -2323,7 +2393,12 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
         tail_sounding: false,
         lookahead,
         companion: if channels > 2 {
-            match PcmEncoder::new(settings.sample_rate, 2, settings.use_vbr, settings.opus_bitrate) {
+            match PcmEncoder::new(
+                settings.sample_rate,
+                2,
+                settings.use_vbr,
+                settings.opus_bitrate,
+            ) {
                 Ok(e) => Some((e, vec![0i16; frame_size_per_channel * 2])),
                 Err(e) => {
                     elog!("[pcmflux] stereo companion unavailable: {e}");
@@ -2372,8 +2447,14 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
             break;
         }
         if session.is_none() {
-            let opened =
-                pa_capture_session_open(inner, &spec, device, &attr, adjust_latency, ever_connected);
+            let opened = pa_capture_session_open(
+                inner,
+                &spec,
+                device,
+                &attr,
+                adjust_latency,
+                ever_connected,
+            );
             let cap = match (&opened, ever_connected) {
                 (Err(SessionOpenError::DeviceNotFound(_)), _) => DEVICE_WAIT_TRIES,
                 (_, true) => RECONNECT_TRIES,
@@ -2395,12 +2476,12 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                             settings.sample_rate,
                             settings.channels,
                             settings.opus_bitrate / 1000,
-                            if settings.use_vbr {
+                            if settings.use_vbr { "On" } else { "Off" },
+                            if settings.use_silence_gate {
                                 "On"
                             } else {
                                 "Off"
-                            },
-                            if settings.use_silence_gate { "On" } else { "Off" }
+                            }
                         );
                     } else {
                         plog!("[pcmflux] audio capture reconnected; resuming.");
@@ -2413,7 +2494,9 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                         terminal_error = Some(e);
                         break;
                     }
-                    elog!("[pcmflux] audio capture open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms");
+                    elog!(
+                        "[pcmflux] audio capture open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms"
+                    );
                     let mut slept = 0u64;
                     while slept < backoff_ms && !inner.stop_pending() {
                         std::thread::sleep(Duration::from_millis(50));
@@ -2481,7 +2564,11 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
                 };
                 plog!(
                     "[pcmflux] Status | Read: {}, Silent: {} ({:.1}%), Encoded: {}, Rate: {:.2} kbps",
-                    run.chunks_read, run.chunks_silent, silent_pct, run.chunks_encoded, kbps
+                    run.chunks_read,
+                    run.chunks_silent,
+                    silent_pct,
+                    run.chunks_encoded,
+                    kbps
                 );
                 last_log = Instant::now();
                 run.chunks_read = 0;
@@ -2495,7 +2582,11 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     if let Some(e) = terminal_error {
         inner.fail(format!(
             "audio capture could not {} (last error: {e}); stopping.",
-            if ever_connected { "stay connected" } else { "connect" }
+            if ever_connected {
+                "stay connected"
+            } else {
+                "connect"
+            }
         ));
     } else {
         plog!("[pcmflux] Stop requested. Cleaning up capture loop...");
@@ -2516,7 +2607,6 @@ fn capture_run(inner: &Arc<Inner>, settings: &Settings, callback: Option<&Py<PyA
     }
     plog!("[pcmflux] Audio capture loop finished. Resources released.");
 }
-
 
 /// One PulseAudio session for playback: mainloop, context, and the playback stream, all
 /// recreated together on reconnect — the mirror of `PaCaptureSession`, with the same
@@ -2598,7 +2688,9 @@ fn pa_playback_session_open(
             return Err(SessionOpenError::Aborted);
         }
         if !pump(&mut mainloop, PUMP_TIMEOUT_US) {
-            return Err(tr("mainloop iterate failed during stream connect (playback)"));
+            return Err(tr(
+                "mainloop iterate failed during stream connect (playback)",
+            ));
         }
     }
     Ok(PaPlaybackSession {
@@ -2640,7 +2732,9 @@ fn pa_playback_session_open(
 /// spliced out of the queue's head, so the uplink's delay returns to the sink's own
 /// buffer after a burst and does not grow with a client clock running fast.
 fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
-    inner.debug_logging.store(settings.debug_logging, Ordering::Relaxed);
+    inner
+        .debug_logging
+        .store(settings.debug_logging, Ordering::Relaxed);
 
     // Sample rate and channel count were validated by `extract_pb_settings`.
     let spec = Spec {
@@ -2656,8 +2750,7 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
         settings.latency_ms
     );
 
-    let tlength =
-        spec.usec_to_bytes(MicroSeconds(settings.latency_ms.max(0) as u64 * 1000)) as u32;
+    let tlength = spec.usec_to_bytes(MicroSeconds(settings.latency_ms.max(0) as u64 * 1000)) as u32;
     let attr = BufferAttr {
         maxlength: u32::MAX,
         tlength,
@@ -2681,8 +2774,7 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     let mut bytes_cut: u64 = 0;
     let mut writable_hits: u64 = 0;
     let mut last_pb_log = Instant::now();
-    let mut standing =
-        StandingDepth::new(spec.bytes_per_second(), spec.frame_size());
+    let mut standing = StandingDepth::new(spec.bytes_per_second(), spec.frame_size());
 
     loop {
         if inner.stop_pending() {
@@ -2716,12 +2808,18 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
                 Err(SessionOpenError::Aborted) => break,
                 Err(SessionOpenError::DeviceNotFound(e)) | Err(SessionOpenError::Transient(e)) => {
                     tries += 1;
-                    let cap = if ever_connected { RECONNECT_TRIES } else { START_TRIES };
+                    let cap = if ever_connected {
+                        RECONNECT_TRIES
+                    } else {
+                        START_TRIES
+                    };
                     if tries >= cap {
                         terminal_error = Some(e);
                         break;
                     }
-                    elog!("[pcmflux] audio playback open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms");
+                    elog!(
+                        "[pcmflux] audio playback open failed ({e}); retry {tries}/{cap} in {backoff_ms}ms"
+                    );
                     let mut slept = 0u64;
                     while slept < backoff_ms && !inner.stop_pending() {
                         std::thread::sleep(Duration::from_millis(50));
@@ -2744,23 +2842,25 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
             continue;
         }
         if let Some(can) = s.stream.writable_size()
-            && can > 0 {
-                writable_hits += 1;
-                let left = queue.drain_upto(can, &mut scratch);
-                if !scratch.is_empty() {
-                    if let Err(e) =
-                        s.stream.write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
-                    {
-                        elog!("[pcmflux] ERROR: pa_stream_write() failed: {e:?}");
-                    } else {
-                        bytes_written += scratch.len() as u64;
-                    }
-                }
-                if let Some(cut) = standing.after_drain(scratch.len(), left) {
-                    queue.splice_head(cut, standing.keep);
-                    bytes_cut += cut as u64;
+            && can > 0
+        {
+            writable_hits += 1;
+            let left = queue.drain_upto(can, &mut scratch);
+            if !scratch.is_empty() {
+                if let Err(e) = s
+                    .stream
+                    .write(&scratch, None, 0, pulse::stream::SeekMode::Relative)
+                {
+                    elog!("[pcmflux] ERROR: pa_stream_write() failed: {e:?}");
+                } else {
+                    bytes_written += scratch.len() as u64;
                 }
             }
+            if let Some(cut) = standing.after_drain(scratch.len(), left) {
+                queue.splice_head(cut, standing.keep);
+                bytes_cut += cut as u64;
+            }
+        }
         if inner.debug_logging.load(Ordering::Relaxed) && last_pb_log.elapsed().as_secs() >= 1 {
             plog!(
                 "[pcmflux] Playback | writable_hits: {writable_hits}, bytes_written: {bytes_written}, queued: {}, standing depth cut: {bytes_cut}",
@@ -2773,7 +2873,11 @@ fn playback_run(inner: &Inner, settings: &PbSettings, queue: &PlayQueue) {
     if let Some(e) = terminal_error {
         inner.fail(format!(
             "audio playback could not {} (last error: {e}); stopping.",
-            if ever_connected { "stay connected" } else { "connect" }
+            if ever_connected {
+                "stay connected"
+            } else {
+                "connect"
+            }
         ));
     } else {
         plog!("[pcmflux] Stop requested. Cleaning up playback loop...");
@@ -2865,7 +2969,7 @@ impl AudioCapture {
             None => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "capture thread spawn failed",
-                ))
+                ));
             }
         };
 
@@ -2913,7 +3017,9 @@ impl AudioCapture {
     /// that decode no multistream Opus. Off by default, it keeps its setting across
     /// restarts, and a mono or stereo capture ignores it.
     fn set_stereo_companion(&self, enabled: bool) {
-        self.inner().stereo_companion.store(enabled, Ordering::Relaxed);
+        self.inner()
+            .stereo_companion
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// True while a capture worker is connected and running with no stop pending; false
@@ -3001,7 +3107,11 @@ impl AudioPlayback {
         if let Ok(b) = data.cast::<PyBytes>() {
             let packet = b.as_bytes();
             py.detach(|| {
-                let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
+                let mut dec = self
+                    .shared
+                    .opus_dec
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(d) = dec.as_mut() {
                     decode(d, packet, queue);
                 }
@@ -3014,7 +3124,11 @@ impl AudioPlayback {
                 "a contiguous bytes-like object is required",
             ));
         }
-        let mut dec = self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dec = self
+            .shared
+            .opus_dec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(d) = dec.as_mut() else {
             return Ok(());
         };
@@ -3074,7 +3188,9 @@ impl AudioPlayback {
 
         let parsed = extract_pb_settings(settings)?;
         let frame_bytes = (parsed.channels.max(1) as usize) * 2;
-        self.shared.queue.configure(parsed.max_buffer_bytes, frame_bytes);
+        self.shared
+            .queue
+            .configure(parsed.max_buffer_bytes, frame_bytes);
 
         let decoder = OpusPlaybackDecoder::new(parsed.sample_rate, parsed.channels);
         if decoder.is_none() {
@@ -3082,7 +3198,11 @@ impl AudioPlayback {
                 "failed to create Opus decoder for playback",
             ));
         }
-        *self.shared.opus_dec.lock().unwrap_or_else(|e| e.into_inner()) = decoder;
+        *self
+            .shared
+            .opus_dec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = decoder;
 
         let shared = &self.shared;
         let inner_ref = &inner;
@@ -3096,7 +3216,7 @@ impl AudioPlayback {
             None => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "playback thread spawn failed",
-                ))
+                ));
             }
         };
 
@@ -3261,8 +3381,11 @@ mod tests {
         dec.decode_red_into_queue(&build_red_payload(&[(480, &f[0])], &f[1]), next, &q);
         let mut out = Vec::new();
         q.drain_upto(1 << 20, &mut out);
-        assert_eq!(out.len(), 2 * FRAME_PCM_BYTES,
-            "frame after the 32-bit wrap was dropped as a duplicate");
+        assert_eq!(
+            out.len(),
+            2 * FRAME_PCM_BYTES,
+            "frame after the 32-bit wrap was dropped as a duplicate"
+        );
     }
 
     /// The re-entrancy guard must recognize BOTH of a run's own threads: the
@@ -3274,12 +3397,21 @@ mod tests {
     fn reentrancy_guard_matches_delivery_thread() {
         let inner = Inner::new();
         let me = gettid();
-        assert!(!inner.is_own_thread(me), "no run live: nothing should match");
+        assert!(
+            !inner.is_own_thread(me),
+            "no run live: nothing should match"
+        );
         inner.deliver_tid.store(me, Ordering::Release);
-        assert!(inner.is_own_thread(me), "delivery tid must short-circuit the guard");
+        assert!(
+            inner.is_own_thread(me),
+            "delivery tid must short-circuit the guard"
+        );
         inner.deliver_tid.store(0, Ordering::Release);
         inner.capture_tid.store(me, Ordering::Release);
-        assert!(inner.is_own_thread(me), "capture tid must still short-circuit the guard");
+        assert!(
+            inner.is_own_thread(me),
+            "capture tid must still short-circuit the guard"
+        );
     }
 
     /// Encode 5.1 with a tone only on FC (input channel 2), decode with the same
@@ -3292,8 +3424,8 @@ mod tests {
         let mut enc = PcmEncoder::new(48000, channels as i32, true, 256000).expect("encoder");
         let mut pcm = vec![0i16; frame * channels];
         for i in 0..frame {
-            let v = (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin())
-                as i16;
+            let v =
+                (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin()) as i16;
             pcm[i * channels + 2] = v;
         }
         let mut out = vec![0u8; 4 * MAX_OPUS_PACKET];
@@ -3395,7 +3527,10 @@ mod tests {
             sounding: false,
             tail_sounding: false,
             lookahead: 120,
-            companion: Some((PcmEncoder::new(48000, 2, true, 256000).expect("stereo"), vec![0i16; frame * 2])),
+            companion: Some((
+                PcmEncoder::new(48000, 2, true, 256000).expect("stereo"),
+                vec![0i16; frame * 2],
+            )),
             companion_bitrate: 256000,
             total_samples_processed: 0,
             ogg: None,
@@ -3409,7 +3544,8 @@ mod tests {
         };
         let mut pcm = vec![0i16; frame * 6];
         for i in 0..frame {
-            pcm[i * 6 + 2] = ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin() * 8000.0) as i16;
+            pcm[i * 6 + 2] =
+                ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin() * 8000.0) as i16;
         }
         run.feed(bytemuck::cast_slice(&pcm));
         inner.stereo_companion.store(true, Ordering::Relaxed);
@@ -3419,11 +3555,33 @@ mod tests {
         let tone_frames = ring.q.lock().unwrap().as_ref().expect("ring open").len();
         run.feed(bytemuck::cast_slice(&vec![0i16; frame * 6]));
         let queued = ring.q.lock().unwrap();
-        let frames: Vec<(Vec<u8>, u64, u8)> = queued.as_ref().expect("ring open").iter().cloned().collect();
-        let tags: Vec<(u64, u8, bool)> = frames.iter().map(|(d, p, c)| (*p, *c, d[1] & WS_QUIET != 0)).collect();
-        assert_eq!(tags, vec![(0, 6, false), (480, 6, false), (480, 2, false), (960, 6, false), (960, 2, false),
-                              (1440, 6, false), (1440, 2, false), (1920, 6, false), (1920, 2, false),
-                              (2400, 6, true), (2400, 6, true), (2400, 2, true)]);
+        let frames: Vec<(Vec<u8>, u64, u8)> = queued
+            .as_ref()
+            .expect("ring open")
+            .iter()
+            .cloned()
+            .collect();
+        let tags: Vec<(u64, u8, bool)> = frames
+            .iter()
+            .map(|(d, p, c)| (*p, *c, d[1] & WS_QUIET != 0))
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                (0, 6, false),
+                (480, 6, false),
+                (480, 2, false),
+                (960, 6, false),
+                (960, 2, false),
+                (1440, 6, false),
+                (1440, 2, false),
+                (1920, 6, false),
+                (1920, 2, false),
+                (2400, 6, true),
+                (2400, 6, true),
+                (2400, 2, true)
+            ]
+        );
         let mut dec = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
         let mut last = Vec::new();
         for (data, _, c) in &frames[..tone_frames] {
@@ -3432,8 +3590,22 @@ mod tests {
             }
         }
         let samples: &[i16] = bytemuck::cast_slice(&last);
-        let rms = |ch: usize| (samples.iter().skip(ch).step_by(2).map(|&v| (v as f64).powi(2)).sum::<f64>() / frame as f64).sqrt();
-        assert!(rms(0) > 2000.0 && rms(1) > 2000.0, "center tone on both sides: {} {}", rms(0), rms(1));
+        let rms = |ch: usize| {
+            (samples
+                .iter()
+                .skip(ch)
+                .step_by(2)
+                .map(|&v| (v as f64).powi(2))
+                .sum::<f64>()
+                / frame as f64)
+                .sqrt()
+        };
+        assert!(
+            rms(0) > 2000.0 && rms(1) > 2000.0,
+            "center tone on both sides: {} {}",
+            rms(0),
+            rms(1)
+        );
     }
 
     /// Every surround layout the encoder takes has a channel map libpulse parses, with one
@@ -3448,7 +3620,12 @@ mod tests {
             let pos = map.get();
             assert_eq!(
                 &pos[..4],
-                &[Position::FrontLeft, Position::FrontRight, Position::FrontCenter, Position::Lfe]
+                &[
+                    Position::FrontLeft,
+                    Position::FrontRight,
+                    Position::FrontCenter,
+                    Position::Lfe
+                ]
             );
         }
         assert!(surround_channel_map(2).is_none() && surround_channel_map(1).is_none());
@@ -3523,7 +3700,10 @@ mod tests {
         assert_eq!(body[0], 0x01);
         let n_red = body[1] as usize;
         assert_eq!(n_red, 2);
-        assert_eq!(u32::from_be_bytes([body[2], body[3], body[4], body[5]]), 1920);
+        assert_eq!(
+            u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+            1920
+        );
 
         let mut idx = 6;
         let mut offsets = Vec::new();
@@ -3655,13 +3835,20 @@ mod tests {
         let body = build_ws_body(&primary, primary_pts, &hist, 4, true);
         assert_eq!(body[0], 0x01);
         assert_eq!(body[1], 1, "only the in-range block survives");
-        assert_eq!(u32::from_be_bytes([body[2], body[3], body[4], body[5]]), primary_pts as u32);
+        assert_eq!(
+            u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+            primary_pts as u32
+        );
 
         let word = ((body[7] as u32) << 16) | ((body[8] as u32) << 8) | (body[9] as u32);
         assert_eq!((word >> 10) & 0x3FFF, 960);
         let len = (word & 0x3FF) as usize;
         assert_eq!(len, good.len());
-        assert_eq!(body[10] & 0x80, 0x00, "primary header follows the one redundant header");
+        assert_eq!(
+            body[10] & 0x80,
+            0x00,
+            "primary header follows the one redundant header"
+        );
         assert_eq!(&body[11..11 + len], &good[..]);
         assert_eq!(&body[11 + len..], &primary[..]);
     }
@@ -3726,7 +3913,9 @@ mod tests {
                 chunks_encoded: 0,
                 bytes_encoded: 0,
             };
-            let tone: Vec<i16> = (0..frame * 2).map(|i| ((i as f64 * 0.3).sin() * 8000.0) as i16).collect();
+            let tone: Vec<i16> = (0..frame * 2)
+                .map(|i| ((i as f64 * 0.3).sin() * 8000.0) as i16)
+                .collect();
             let quiet = vec![0i16; frame * 2];
             for pcm in [&quiet, &tone, &tone, &quiet, &quiet, &quiet, &tone, &tone] {
                 run.feed(bytemuck::cast_slice(pcm));
@@ -3734,14 +3923,29 @@ mod tests {
             let queued = ring.q.lock().unwrap();
             let frames = queued.as_ref().expect("ring open");
             let pts: Vec<u64> = frames.iter().map(|(_, p, _)| *p).collect();
-            let quiet_frames: Vec<&Vec<u8>> = frames.iter().map(|(d, _, _)| d).filter(|d| d.len() == 2).collect();
+            let quiet_frames: Vec<&Vec<u8>> = frames
+                .iter()
+                .map(|(d, _, _)| d)
+                .filter(|d| d.len() == 2)
+                .collect();
             if header {
                 assert_eq!(pts, vec![480, 960, 1440, 1440, 2880, 3360], "red={red}");
                 assert_eq!(quiet_frames, vec![&vec![0x01, WS_QUIET]], "red={red}");
-                assert_eq!(frames[2].0.len(), 2, "the bare mark goes where the sound ends");
-                assert!(frames[3].0.len() > 2 && frames[3].0[1] & WS_QUIET != 0,
-                        "the silent frame behind it carries the mark too");
-                assert!(frames.iter().enumerate().all(|(i, (d, _, _))| i == 2 || i == 3 || d[1] & WS_QUIET == 0));
+                assert_eq!(
+                    frames[2].0.len(),
+                    2,
+                    "the bare mark goes where the sound ends"
+                );
+                assert!(
+                    frames[3].0.len() > 2 && frames[3].0[1] & WS_QUIET != 0,
+                    "the silent frame behind it carries the mark too"
+                );
+                assert!(
+                    frames
+                        .iter()
+                        .enumerate()
+                        .all(|(i, (d, _, _))| i == 2 || i == 3 || d[1] & WS_QUIET == 0)
+                );
                 assert_eq!(frames[4].0[1], 0x00, "sound resumes with the plain header");
             } else {
                 assert_eq!(pts, vec![480, 960, 1440, 2880, 3360]);
@@ -3790,7 +3994,8 @@ mod tests {
         };
         let mut click = vec![0i16; frame * 2];
         for i in frame - 96..frame {
-            let v = ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0) as i16;
+            let v =
+                ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0) as i16;
             click[i * 2] = v;
             click[i * 2 + 1] = v;
         }
@@ -3799,16 +4004,26 @@ mod tests {
             run.feed(bytemuck::cast_slice(pcm));
         }
         let queued = ring.q.lock().unwrap();
-        let marked: Vec<(u64, usize)> = queued.as_ref().expect("ring open").iter()
-            .filter(|(d, _, _)| d[1] & WS_QUIET != 0).map(|(d, p, _)| (*p, d.len().min(3))).collect();
-        assert_eq!(marked, vec![(960, 2), (960, 3)], "the bare mark, then the frame that ends the sound");
+        let marked: Vec<(u64, usize)> = queued
+            .as_ref()
+            .expect("ring open")
+            .iter()
+            .filter(|(d, _, _)| d[1] & WS_QUIET != 0)
+            .map(|(d, p, _)| (*p, d.len().min(3)))
+            .collect();
+        assert_eq!(
+            marked,
+            vec![(960, 2), (960, 3)],
+            "the bare mark, then the frame that ends the sound"
+        );
         let mut decoder = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
         let mut peak = 0i32;
         for (data, _, _) in queued.as_ref().expect("ring open") {
             if data.len() <= 2 {
                 continue;
             }
-            let pcm: &[i16] = bytemuck::cast_slice(decoder.decode_to_pcm(&data[2..]).expect("decode"));
+            let pcm: &[i16] =
+                bytemuck::cast_slice(decoder.decode_to_pcm(&data[2..]).expect("decode"));
             peak = peak.max(pcm.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
         }
         assert!(peak > 8000, "the sound's tail decodes at {peak}");
@@ -3857,7 +4072,8 @@ mod tests {
             let mut click = vec![0i16; frame * 2];
             let burst = if late { frame - 96..frame } else { 96..192 };
             for i in burst {
-                let v = ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0) as i16;
+                let v = ((i as f64 * 2.0 * std::f64::consts::PI * 1500.0 / 48000.0).sin() * 16000.0)
+                    as i16;
                 click[i * 2] = v;
                 click[i * 2 + 1] = v;
             }
@@ -3869,14 +4085,23 @@ mod tests {
             let frames = queued.as_ref().expect("ring open");
             let pts: Vec<u64> = frames.iter().map(|(_, p, _)| *p).collect();
             if !late {
-                assert_eq!(pts, vec![480], "a burst that ended before the lookahead needs no tail");
+                assert_eq!(
+                    pts,
+                    vec![480],
+                    "a burst that ended before the lookahead needs no tail"
+                );
                 continue;
             }
-            assert_eq!(pts, vec![480, 960], "the silent frame carrying the burst's end follows it");
+            assert_eq!(
+                pts,
+                vec![480, 960],
+                "the silent frame carrying the burst's end follows it"
+            );
             let mut decoder = OpusPlaybackDecoder::new(48000, 2).expect("decoder");
             let mut peak = 0i32;
             for (data, _, _) in frames {
-                let pcm: &[i16] = bytemuck::cast_slice(decoder.decode_to_pcm(data).expect("decode"));
+                let pcm: &[i16] =
+                    bytemuck::cast_slice(decoder.decode_to_pcm(data).expect("decode"));
                 peak = peak.max(pcm.iter().map(|&v| (v as i32).abs()).max().unwrap_or(0));
             }
             assert!(peak > 8000, "the burst decodes at {peak}");
@@ -3923,12 +4148,20 @@ mod tests {
                 bytes_encoded: 0,
             };
             run.emit_quiet(0);
-            let tone: Vec<i16> = (0..frame * 2).map(|i| ((i as f64 * 0.3).sin() * 8000.0) as i16).collect();
+            let tone: Vec<i16> = (0..frame * 2)
+                .map(|i| ((i as f64 * 0.3).sin() * 8000.0) as i16)
+                .collect();
             run.feed(bytemuck::cast_slice(&tone));
             run.emit_quiet(480);
             run.emit_quiet(480);
             let queued = ring.q.lock().unwrap();
-            let bare: Vec<&Vec<u8>> = queued.as_ref().expect("ring open").iter().map(|(d, _, _)| d).filter(|d| d.len() == 2).collect();
+            let bare: Vec<&Vec<u8>> = queued
+                .as_ref()
+                .expect("ring open")
+                .iter()
+                .map(|(d, _, _)| d)
+                .filter(|d| d.len() == 2)
+                .collect();
             if header {
                 assert_eq!(bare, vec![&vec![0x01, WS_QUIET]]);
             } else {
@@ -3977,7 +4210,10 @@ mod tests {
                         return;
                     }
                     spins += 1;
-                    assert!(spins < 50_000_000, "external stop was lost (would hang the join)");
+                    assert!(
+                        spins < 50_000_000,
+                        "external stop was lost (would hang the join)"
+                    );
                 }
             });
             inner.request_external_stop();
@@ -4068,9 +4304,20 @@ mod tests {
         assert_eq!(q.drain_upto(1 << 20, &mut out), 0);
         let got: Vec<i16> = bytemuck::cast_slice::<u8, i16>(&out).to_vec();
         assert_eq!(got.len(), 200);
-        assert!((got[0] - 1000).abs() < 70, "first sample stays near the head: {}", got[0]);
-        assert!((got[47] - tail[47]).abs() < 70, "last blended sample reaches the tail: {}", got[47]);
-        assert!(got.windows(2).take(48).all(|w| (w[1] - w[0]).abs() < 70), "no step inside the fade");
+        assert!(
+            (got[0] - 1000).abs() < 70,
+            "first sample stays near the head: {}",
+            got[0]
+        );
+        assert!(
+            (got[47] - tail[47]).abs() < 70,
+            "last blended sample reaches the tail: {}",
+            got[47]
+        );
+        assert!(
+            got.windows(2).take(48).all(|w| (w[1] - w[0]).abs() < 70),
+            "no step inside the fade"
+        );
         assert_eq!(&got[48..], &tail[48..]);
 
         let short = PlayQueue::new();
@@ -4115,9 +4362,7 @@ mod tests {
                     next_arrival = k as f64 * 0.020 / (1.0 + skew);
                 }
                 let left = q.drain_upto(480, &mut out);
-                if cut
-                    && let Some(n) = standing.after_drain(out.len(), left)
-                {
+                if cut && let Some(n) = standing.after_drain(out.len(), left) {
                     q.splice_head(n, standing.keep);
                 }
                 let depth = q.buf.lock().unwrap().len();
@@ -4130,7 +4375,10 @@ mod tests {
             (worst_late, end)
         }
         let (late, _) = run(true, 0.0, 30.0, true);
-        assert!(late <= 960 + 480, "burst shed by 8 s: {late} bytes still standing");
+        assert!(
+            late <= 960 + 480,
+            "burst shed by 8 s: {late} bytes still standing"
+        );
         let (_, held) = run(true, 0.0, 30.0, false);
         assert!(held >= 20_000, "without the cut the burst stands: {held}");
         let (drift, _) = run(false, 0.001, 600.0, true);
@@ -4185,7 +4433,11 @@ mod tests {
         assert!(inner.running());
 
         inner.request_external_stop();
-        assert_eq!(inner.state_name(), "idle", "a pending stop is no longer running");
+        assert_eq!(
+            inner.state_name(),
+            "idle",
+            "a pending stop is no longer running"
+        );
         inner.clear_stop();
 
         inner.fail("source vanished".to_string());
@@ -4202,7 +4454,11 @@ mod tests {
         })
         .unwrap();
         slot.lock().unwrap().take().unwrap().join().unwrap();
-        assert_eq!(inner.last_error(), None, "a new run must start with no stale error");
+        assert_eq!(
+            inner.last_error(),
+            None,
+            "a new run must start with no stale error"
+        );
         assert_eq!(inner.state_name(), "idle", "a clean stop reads idle again");
     }
 
@@ -4213,8 +4469,7 @@ mod tests {
     fn worker_panic_records_last_error() {
         let inner = Arc::new(Inner::new());
         let slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
-        spawn_worker(&slot, &inner, "panicky", || panic!("boom"))
-            .unwrap();
+        spawn_worker(&slot, &inner, "panicky", || panic!("boom")).unwrap();
         slot.lock().unwrap().take().unwrap().join().unwrap();
         assert_eq!(inner.state_name(), "failed");
         assert_eq!(
@@ -4263,7 +4518,10 @@ mod tests {
         }
 
         join_failed_start(&slot, &inner, l_id);
-        assert!(slot.lock().unwrap().is_some(), "winner's handle must survive");
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "winner's handle must survive"
+        );
         assert_eq!(inner.stop_state.load(Ordering::Acquire), STOP_NONE);
         assert!(inner.worker_alive(), "winner must still be running");
 
@@ -4332,9 +4590,15 @@ mod tests {
             b.join().unwrap();
 
             assert_eq!(runs.load(Ordering::Acquire), 2);
-            assert!(slot.lock().unwrap().is_some(), "winner's thread must survive");
+            assert!(
+                slot.lock().unwrap().is_some(),
+                "winner's thread must survive"
+            );
             assert_eq!(inner.start_state.load(Ordering::Acquire), ST_RUNNING);
-            assert!(inner.worker_alive(), "winner must still be alive after both starts");
+            assert!(
+                inner.worker_alive(),
+                "winner must still be alive after both starts"
+            );
 
             {
                 let mut g = slot.lock().unwrap();
@@ -4399,7 +4663,12 @@ mod tests {
         let pool = Arc::new(BufferPool::new(32));
         let buf = pool.take();
         let ptr = buf.as_ptr() as usize;
-        drop(AudioFrame { data: buf, pts: 0, channels: 2, pool: Some(Arc::clone(&pool)) });
+        drop(AudioFrame {
+            data: buf,
+            pts: 0,
+            channels: 2,
+            pool: Some(Arc::clone(&pool)),
+        });
         let recycled = pool.take();
         assert_eq!(recycled.as_ptr() as usize, ptr);
     }
@@ -4441,8 +4710,7 @@ mod tests {
             let new = Instant::now();
             for i in 0..ITERS {
                 let mut data = taker.take();
-                let prefix =
-                    write_ws_prefix_into(&mut data, 960 + i as u64, &hist, red, true);
+                let prefix = write_ws_prefix_into(&mut data, 960 + i as u64, &hist, red, true);
                 data[prefix..prefix + PAYLOAD].copy_from_slice(&src);
                 data.truncate(prefix + PAYLOAD);
                 black_box(&data);

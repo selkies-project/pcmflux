@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -56,7 +56,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= (b as u32) << 24;
         for _ in 0..8 {
-            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ CRC_POLY } else { crc << 1 };
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ CRC_POLY
+            } else {
+                crc << 1
+            };
         }
     }
     crc
@@ -129,14 +133,16 @@ impl OggSink {
                     .map_err(|e| e.to_string())
             })
             .map_err(|e| format!("output_socket {path} cannot be bound: {e}"))?;
-        let serial = std::process::id() ^ (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0));
+        let serial = std::process::id()
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0));
         let headers = Arc::new(header_pages(serial, head));
         let clients: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (clients_acc, shutdown_acc, path_log) = (clients.clone(), shutdown.clone(), path.to_string());
+        let (clients_acc, shutdown_acc, path_log) =
+            (clients.clone(), shutdown.clone(), path.to_string());
         thread::spawn(move || {
             while !shutdown_acc.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -149,7 +155,9 @@ impl OggSink {
                         thread::spawn(move || {
                             let mut stream = stream;
                             for bytes in rx.iter() {
-                                if stop_writer.load(Ordering::Relaxed) || stream.write_all(&bytes).is_err() {
+                                if stop_writer.load(Ordering::Relaxed)
+                                    || stream.write_all(&bytes).is_err()
+                                {
                                     break;
                                 }
                             }
@@ -157,7 +165,9 @@ impl OggSink {
                         clients_acc.lock().unwrap().push(Client { tx, stop });
                         eprintln!("[pcmflux] ogg sink consumer connected on {path_log}");
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL_INTERVAL),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(ACCEPT_POLL_INTERVAL)
+                    }
                     Err(e) => {
                         eprintln!("[pcmflux] ogg sink accept error: {e}");
                         thread::sleep(Duration::from_millis(500));
@@ -165,7 +175,13 @@ impl OggSink {
                 }
             }
         });
-        Ok(Self { path: path.to_string(), clients, shutdown, serial, seq: 2 })
+        Ok(Self {
+            path: path.to_string(),
+            clients,
+            shutdown,
+            serial,
+            seq: 2,
+        })
     }
 
     /// Send one packet as a page; `granule` is the 48 kHz sample count at its end.
@@ -206,19 +222,37 @@ mod tests {
     fn a_stale_socket_of_this_session_is_replaced() {
         let path = format!("/tmp/pcmflux-ogg-stale-{}.sock", std::process::id());
         fs::write(&path, b"stale").unwrap();
-        let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
+        let head = OpusHead {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            mapping: None,
+        };
         let sink = OggSink::bind(&path, &head);
-        assert!(sink.is_ok(), "an own leftover is removed and the socket bound");
+        assert!(
+            sink.is_ok(),
+            "an own leftover is removed and the socket bound"
+        );
         drop(sink);
-        assert!(fs::symlink_metadata(&path).is_err(), "the socket is removed with the sink");
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the socket is removed with the sink"
+        );
     }
 
     /// A path that cannot be bound is an error naming it, not a sink that serves nobody.
     #[test]
     fn an_unbindable_path_is_an_error() {
         let path = format!("/tmp/pcmflux-ogg-missing-{}/rec.sock", std::process::id());
-        let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
-        let err = OggSink::bind(&path, &head).err().expect("a missing directory is refused");
+        let head = OpusHead {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            mapping: None,
+        };
+        let err = OggSink::bind(&path, &head)
+            .err()
+            .expect("a missing directory is refused");
         assert!(err.contains(&path), "{err}");
     }
 
@@ -231,10 +265,17 @@ mod tests {
     fn stream_pages_are_well_formed() {
         assert_eq!(crc32(b"123456789"), 0x89a1_897f);
         let path = format!("/tmp/pcmflux-ogg-test-{}.sock", std::process::id());
-        let head = OpusHead { channels: 2, pre_skip: 312, input_sample_rate: 48000, mapping: None };
+        let head = OpusHead {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            mapping: None,
+        };
         let mut sink = OggSink::bind(&path, &head).expect("bind");
         let mut consumer = UnixStream::connect(&path).expect("connect");
-        consumer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        consumer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         thread::sleep(Duration::from_millis(150));
         sink.write_packet(&[0xfc, 1, 2, 3], 960);
         sink.write_packet(&vec![0xfc; 255], 1920);
@@ -242,9 +283,13 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let mut got = Vec::new();
         while let Ok(n) = consumer.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             got.extend_from_slice(&buf[..n]);
-            if got.len() >= 27 * 4 + 19 + 27 + 4 + 259 { break; }
+            if got.len() >= 27 * 4 + 19 + 27 + 4 + 259 {
+                break;
+            }
         }
         let mut pages = Vec::new();
         let mut laces = Vec::new();
@@ -252,7 +297,10 @@ mod tests {
         while at + 27 <= got.len() {
             assert_eq!(&got[at..at + 4], b"OggS");
             let segments = got[at + 26] as usize;
-            let body: usize = got[at + 27..at + 27 + segments].iter().map(|&l| l as usize).sum();
+            let body: usize = got[at + 27..at + 27 + segments]
+                .iter()
+                .map(|&l| l as usize)
+                .sum();
             let end = at + 27 + segments + body;
             let mut copy = got[at..end].to_vec();
             let stored = u32::from_le_bytes(copy[22..26].try_into().unwrap());
