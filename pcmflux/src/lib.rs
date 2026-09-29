@@ -3685,7 +3685,7 @@ mod tests {
     }
 
     /// `red_distance == 2`: parse the emitted body back (`n_red` 4-byte headers, the
-    /// 1-byte primary header, block datas split by their lengths) and assert the primary and
+    /// 1-byte primary header, block data split by their lengths) and assert the primary and
     /// the two redundant blocks round-trip with the expected oldest-first offsets 1920 & 960.
     #[test]
     fn red_two_roundtrips() {
