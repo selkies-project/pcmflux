@@ -46,3 +46,19 @@ jobs:
       - name: cargo test
         # No sound server runs on a runner; the tests that need one are ignored.
         run: cargo test --manifest-path pcmflux/Cargo.toml
+
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt
+
+      - name: pre-commit
+        run: |
+          python3 -m pip install "pre-commit==4.6.*"
+          pre-commit run --all-files --show-diff-on-failure
