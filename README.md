@@ -90,15 +90,16 @@ capture.stop_capture()
 
 - `start_capture()` raises `ValueError` for settings the encoder or PulseAudio
   could never accept (sample rate, channel count, frame duration, an
-  `opus_complexity` outside 0–10, negative latency, a NUL in `device_name`) and `RuntimeError` when the capture thread
-  fails within the ~2 s start handshake. A PulseAudio server (or the named
-  source) that is still coming up is retried with backoff for longer than
-  that — `start_capture()` then returns with `state == "starting"`, and the
-  outcome is published asynchronously: `state` becomes `"running"`, or
-  `"failed"` with the reason in `last_error`. The same pair reports a capture
-  that drops out mid-run and exhausts its reconnect budget, so a long-lived
-  caller should poll `last_error` (or `state`) and restart when it is set.
-  `is_capturing` is True only in the `"running"` phase.
+  `opus_complexity` outside 0–10, negative latency, a NUL in `device_name`)
+  and `RuntimeError` when the capture thread fails within the ~2 s start
+  handshake. A PulseAudio server (or the named source) that is still coming up
+  is retried with backoff for longer than that — `start_capture()` then
+  returns with `state == "starting"`, and the outcome is published
+  asynchronously: `state` becomes `"running"`, or `"failed"` with the reason
+  in `last_error`. The same pair reports a capture that drops out mid-run and
+  exhausts its reconnect budget, so a long-lived caller should poll
+  `last_error` (or `state`) and restart when it is set. `is_capturing` is True
+  only in the `"running"` phase.
 - `AudioPlayback.start()` validates `AudioPlaybackSettings` the same way
   (`latency_ms` and `max_buffer_bytes` must be positive) and exposes the same
   `is_running` / `state` / `last_error` trio; `write()` / `write_red()` raise
