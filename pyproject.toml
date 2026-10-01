@@ -17,11 +17,9 @@ before-all = """
     # Rust toolchain (the extension is pure Rust via setuptools-rust/PyO3).
     curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal
     # libpulse (libpulse-sys links it) + libopus (opusic-sys builds the copy it vendors with
-    # cmake and links it statically). gcc/cmake cover the -sys build steps.
+    # cmake and links it statically). gcc/cmake cover the -sys build steps. All four come from
+    # the image's own repositories, so no third-party one (EPEL, RPM Fusion) is added.
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-$(rpm -E %rhel).noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm && \
         dnf install -y \
             pulseaudio-libs-devel \
             gcc \
