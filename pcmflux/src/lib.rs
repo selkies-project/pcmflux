@@ -75,6 +75,9 @@ macro_rules! elog {
 }
 
 mod ogg_sink;
+mod red;
+
+use red::RED_MAX_DISTANCE;
 
 /// Returns the calling thread's OS tid (`gettid` syscall) so a stop/start issued from
 /// inside the Python callback can detect it is on the capture thread and avoid self-joining.
@@ -115,8 +118,6 @@ const RED_MAX_OFFSET: u64 = 16383;
 const RED_MAX_LEN: usize = 1023;
 /// RED block payload type.
 const RED_BLOCK_PT: u8 = 0;
-/// Max redundant copies per frame and RED history depth.
-const RED_MAX_DISTANCE: i32 = 4;
 /// Bit of a header-carrying capture's second byte that marks where the stream pauses by the
 /// sender's choice. Alone, as `[0x01, WS_QUIET]` with no Opus, it is sent where a sound ends
 /// (and when the session drops after sound): a player plays out what it holds at once
@@ -1199,10 +1200,10 @@ impl OpusPlaybackDecoder {
     /// Opus decode with no Python state, so releasing the GIL keeps the mic path from
     /// serializing behind the rest of the interpreter.
     ///
-    /// 1. **Parse the block headers**: walk the redundant headers (F bit set) collecting each
-    ///    block's 14-bit timestamp offset and 10-bit length, then consume the 1-byte primary
-    ///    header (F bit clear). A truncated payload, or more redundancy than `RED_MAX_DISTANCE`,
-    ///    bails out.
+    /// 1. **Parse the block headers** (`red::red_blocks`): walk the redundant headers (F bit
+    ///    set) collecting each block's 14-bit timestamp offset and 10-bit length, then consume
+    ///    the 1-byte primary header (F bit clear). A truncated payload, or more redundancy than
+    ///    `RED_MAX_DISTANCE`, bails out.
     /// 2. **Resolve block boundaries**: turn the headers into `(ts, start, len)` triples,
     ///    oldest-first, where each redundant `ts` is `primary_ts - offset` and the primary is
     ///    whatever bytes remain.
@@ -1215,42 +1216,9 @@ impl OpusPlaybackDecoder {
     ///    below `last_ts` are already-played duplicates and are skipped — the timestamp dedup
     ///    that makes redundancy free of double-decoding under no loss.
     fn decode_red_into_queue(&mut self, payload: &[u8], primary_ts: i64, queue: &PlayQueue) {
-        let n = payload.len();
-        let mut i = 0usize;
-        let mut offs = [0i64; RED_MAX_DISTANCE as usize];
-        let mut lens = [0usize; RED_MAX_DISTANCE as usize];
-        let mut nh = 0usize;
-        while i < n && (payload[i] & 0x80) != 0 {
-            if i + 4 > n || nh >= RED_MAX_DISTANCE as usize {
-                return;
-            }
-            let field = ((payload[i + 1] as u32) << 16)
-                | ((payload[i + 2] as u32) << 8)
-                | (payload[i + 3] as u32);
-            offs[nh] = ((field >> 10) & 0x3FFF) as i64;
-            lens[nh] = (field & 0x3FF) as usize;
-            nh += 1;
-            i += 4;
-        }
-        if i >= n {
+        let Some((frames, nf)) = red::red_blocks(payload, primary_ts) else {
             return;
-        }
-        i += 1;
-
-        let mut frames = [(0i64, 0usize, 0usize); RED_MAX_DISTANCE as usize + 1];
-        let mut nf = 0usize;
-        for k in 0..nh {
-            if i + lens[k] > n {
-                return;
-            }
-            if lens[k] > 0 {
-                frames[nf] = (primary_ts - offs[k], i, lens[k]);
-                nf += 1;
-            }
-            i += lens[k];
-        }
-        frames[nf] = (primary_ts, i, n - i);
-        nf += 1;
+        };
 
         if self.last_ts.is_none() {
             let (ts, start, len) = frames[nf - 1];
