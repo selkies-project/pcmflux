@@ -3,9 +3,11 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import asyncio
+import hmac
 import http
 import mimetypes
 import os
+import secrets
 import urllib.parse
 import websockets
 import websockets.asyncio.server as ws_async
@@ -45,6 +47,9 @@ SEND_TIMEOUT_SECONDS = 1.0
 # open this socket and listen in. Only the page this server itself hands out may;
 # None keeps non-browser clients, which send no Origin, working.
 ALLOWED_ORIGINS = ["http://localhost:9001", "http://127.0.0.1:9001", "http://[::1]:9001", None]
+# Any account on the host reaches localhost and can send any Origin: the socket also
+# takes only this start's token, which reaches the page in the URL printed below.
+TOKEN = secrets.token_urlsafe(16)
 
 async def send_audio_chunks(websocket, queue):
     """Per-client sender: forwards this client's queue to its socket.
@@ -112,6 +117,9 @@ async def health_check(connection, request):
     if request.path == "/favicon.ico":
         # Return a "204 No Content" response for favicon requests.
         return connection.respond(http.HTTPStatus.NO_CONTENT, "")
+    given = urllib.parse.parse_qs(urllib.parse.urlsplit(request.path).query).get("token", [""])[0]
+    if not hmac.compare_digest(given.encode(), TOKEN.encode()):
+        return connection.respond(http.HTTPStatus.UNAUTHORIZED, "token required\n")
     # Allow all other requests to proceed to the WebSocket handler.
     return None
 
@@ -338,7 +346,7 @@ async def main_async():
         handle_http_request, 'localhost', 9001
     )
     print("HTTP server is serving files from current directory")
-    print("-> Open http://localhost:9001/index.html in your browser.")
+    print(f"-> Open http://localhost:9001/index.html#token={TOKEN} in your browser.")
 
     # Start the WebSocket server. Opus is already compressed, so
     # permessage-deflate would only burn CPU and per-connection memory.

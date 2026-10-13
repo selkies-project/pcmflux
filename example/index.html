@@ -70,7 +70,9 @@
         // --- Configuration and Global Variables ---
 
         // The address of the WebSocket server providing the audio stream.
-        const WEBSOCKET_URL = "ws://localhost:9000";
+        // The server takes only the token of its start, which the URL it prints carries.
+        const TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+        const WEBSOCKET_URL = "ws://localhost:9000/?token=" + encodeURIComponent(TOKEN);
         
         // A reference to the HTML element used to display status messages.
         const statusDiv = document.getElementById('status');
