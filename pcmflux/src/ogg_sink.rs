@@ -25,6 +25,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-consumer backlog: two seconds of 20 ms packets before a consumer is dropped.
 const CLIENT_QUEUE_CAP: usize = 100;
+/// Readers at once, each with a writer thread and a queue; more are refused.
+const MAX_CONSUMERS: usize = 16;
 /// The Ogg page checksum's polynomial, applied to the whole page with the field zeroed.
 const CRC_POLY: u32 = 0x04c1_1db7;
 
@@ -35,6 +37,24 @@ pub struct OpusHead {
     pub pre_skip: u16,
     pub input_sample_rate: u32,
     pub mapping: Option<(u8, u8, Vec<u8>)>,
+}
+
+/// Whether a socket's peer runs as this process's user or as root, who passes the
+/// socket's mode anyway: one that connected before the mode was set is refused here.
+fn peer_is_session_user(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    r == 0 && (cred.uid == unsafe { libc::geteuid() } || cred.uid == 0)
 }
 
 struct Client {
@@ -129,7 +149,12 @@ impl OggSink {
         let listener = stale
             .and_then(|_| {
                 UnixListener::bind(path)
-                    .and_then(|l| l.set_nonblocking(true).map(|_| l))
+                    .and_then(|l| {
+                        use std::os::unix::fs::PermissionsExt;
+                        // Its user's alone, whatever the umask: a reader hears the desktop.
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                        l.set_nonblocking(true).map(|_| l)
+                    })
                     .map_err(|e| e.to_string())
             })
             .map_err(|e| format!("output_socket {path} cannot be bound: {e}"))?;
@@ -147,6 +172,11 @@ impl OggSink {
             while !shutdown_acc.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if !peer_is_session_user(&stream)
+                            || clients_acc.lock().unwrap().len() >= MAX_CONSUMERS
+                        {
+                            continue;
+                        }
                         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
                         let (tx, rx) = sync_channel::<Arc<Vec<u8>>>(CLIENT_QUEUE_CAP);
                         let stop = Arc::new(AtomicBool::new(false));
@@ -241,6 +271,32 @@ mod tests {
     }
 
     /// A path that cannot be bound is an error naming it, not a sink that serves nobody.
+    /// The socket is its user's alone whatever the umask, and a peer of that user is served.
+    #[test]
+    fn the_socket_is_its_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pcmflux-ogg-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("out.sock").to_string_lossy().into_owned();
+        let head = OpusHead {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            mapping: None,
+        };
+        let old = unsafe { libc::umask(0) };
+        let sink = OggSink::bind(&path, &head);
+        unsafe { libc::umask(old) };
+        let sink = sink.expect("bind");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let peer = UnixStream::connect(&path).unwrap();
+        assert!(peer_is_session_user(&peer));
+        drop(sink);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_unbindable_path_is_an_error() {
         let path = format!("/tmp/pcmflux-ogg-missing-{}/rec.sock", std::process::id());
