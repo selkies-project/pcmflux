@@ -34,11 +34,15 @@ consistency, and slightly more GPU or CPU usage is also acceptable if it has no 
 substantial quality improvement) >> Overall Bandwidth Efficiency (since encoded frames are only used once, unlike
 .mp4/.mkv)
 
-Note that parity between X11 and Wayland, as well as between WebSockets and WebRTC, or between the default dashboard
-and the wish dashboard, is considered a key focus (things that were not wired up correctly on either side, and similar
-discrepancies, are subject to fixes or deduplication). I prefer deduplicating code that performs similar purposes
-across different modes over keeping duplicate code for no reason and more fragility. Refactor through deduplication if
-you are confident there will be no regressions (or able to validate regressions). Screen coroutine usage in both
+Note that parity between X11 and Wayland, as well as between WebSockets and WebRTC, between the default dashboard
+and the wish dashboard, or across encoders and codecs (the hardware encoders, NVENC, VA-API, V4L2 M2M and Tegra, and
+the software ones, x264, OpenH264, x265, kvazaar, libvpx, SVT-AV1 and libjpeg-turbo; H.264, H.265, AV1, VP8, VP9 and
+JPEG), is considered a key focus (things that were not wired up correctly on either side, and similar discrepancies,
+are subject to fixes or deduplication; a fix or a feature made for one encoder or codec is checked against every
+other its mechanism applies to and carried there, or the reason one cannot take it is stated). I prefer
+deduplicating code that performs similar purposes across different modes over keeping duplicate code for no reason
+and more fragility. Refactor through deduplication if you are confident there will be no regressions (or able to
+validate regressions). Screen coroutine usage in both
 Python and JavaScript, as well as thread usage in all languages, so that everything is performant and does not lead to
 hanging or lagging. Performance preservation or improvements such as zero-copy and latency-reducing measures are
 always important, and the GIL is held no longer than the work needs. End-to-end latency and an unrestricted frame
