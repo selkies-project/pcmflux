@@ -28,6 +28,22 @@ Safari. Ask before building an environment on a machine that was not set up for 
 closed package manager) and take the operator's directives on how it is constructed and constrained. Say which checks
 could not run where the hardware for them was not available.
 
+`.oss-scanner/` serves Anthropic's OSS Scanner. `threat_model.md` states what pcmflux does, where untrusted bytes
+enter from the weakest principal up, what matters most, how to exercise it, and how severity is rated; `Dockerfile`
+builds the crate and runs its tests offline the way CI's cargo job does. The threat model is the rule the code is
+held to, not a description of it: where the code lets an input reach what the model keeps from it, the code is the
+defect even when its documentation and a test agree with it, and the fix corrects all three. Only a maintainer
+changes the rule itself. Keep the model current in the commit that moves it: a new socket, file written, or parser
+of bytes pcmflux does not write itself joins its entry points. Carry a new system package the build or the tests
+need into `Dockerfile`.
+
+`.clusterfuzzlite/` builds `pcmflux/fuzz` (`cargo fuzz`) in an OSS-Fuzz builder for ClusterFuzzLite
+(`.github/workflows/fuzz.yml`: the code a pull request changes for five minutes, every target for an hour a day)
+and OSS-Fuzz. Code that parses bytes pcmflux does not write itself (a microphone packet, a RED payload, a socket
+peer's request) gets a target in `fuzz/fuzz_targets` that compiles the modules it fuzzes through `#[path]`, so it
+needs none of the crate's system libraries, with seeds in `fuzz/seeds/<target>/` and its source among the
+workflow's `pull_request` paths. A crash the fuzzer finds is fixed at its cause, and its input joins the seeds.
+
 Priority: End-to-End Processing Latency > Resource Usage or Unrestricted Frame Rate >= Quality (non-perceptible or
 statistically insignificant latency fluctuations of up to 5% are acceptable in exchange for quality or bandwidth
 consistency, and slightly more GPU or CPU usage is also acceptable if it has no latency impact and brings a
