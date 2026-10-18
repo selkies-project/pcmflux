@@ -48,10 +48,11 @@ workflow's `pull_request` paths. A crash the fuzzer finds is fixed at its cause,
 CodeQL's code scanning and the other checkers (clippy, rustfmt, ruff and codespell through pre-commit; cargo-deny's
 advisories, licenses and bans; Dependabot's alerts; the OSS Scanner's and the fuzzers' findings) are at least
 stylistic recommendations: a finding is fixed in the code and its alert closed by the next scan or update, never
-dismissed or closed by hand, a case that is so by design included, and a lint is not silenced (`#[allow]`, `noqa`)
-where the code can be written its way. Code that is safe through a check a checker cannot follow (a validator in
-another function, a bound set elsewhere) is rewritten so the check sits where it is recognized (CodeQL's
-`*Customizations.qll` in github/codeql lists the forms), so the checker keeps watching that path.
+dismissed or closed by hand, and a lint is not silenced (`#[allow]`, `noqa`) where the code can be written its way.
+Code that is safe through a check a checker cannot follow (a validator in another function, a bound set elsewhere) is
+rewritten so the check sits where it is recognized (CodeQL's `*Customizations.qll` in github/codeql lists the forms),
+so the checker keeps watching that path. A protocol requirement alone is dismissed, with the standard that fixes it
+named (a hash, port or file format the protocol or its tools prescribe).
 
 Priority: End-to-End Processing Latency > Resource Usage or Unrestricted Frame Rate >= Quality (non-perceptible or
 statistically insignificant latency fluctuations of up to 5% are acceptable in exchange for quality or bandwidth
