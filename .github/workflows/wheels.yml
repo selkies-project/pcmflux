@@ -9,10 +9,7 @@ name: Wheels
 # jobs as JOBS gives its libc; the interpreters of one job share its cargo
 # build, past the first rebuilding only the PyO3 layer and the extension. A job
 # that finds no image builds its wheels the plain way, before-all and all. The
-# wheels are left as `wheels-*` artifacts of the calling run (`artifact`
-# names them otherwise), which may be another repository's: Selkies builds the
-# capture stack it carries through this workflow when no release has it yet,
-# naming the repository and ref to build.
+# wheels are left as `wheels-*` artifacts of the calling run.
 
 on:
   workflow_call:
@@ -21,18 +18,6 @@ on:
         description: Release tag to build and version the wheels as; the calling run's commit is built as it stands when empty
         type: string
         default: ''
-      repository:
-        description: Repository to build the wheels of, for a run of another (owner/name); the calling run's own when empty
-        type: string
-        default: ''
-      ref:
-        description: Branch, tag, or commit of that repository to build as it stands; the tag's, or the calling run's commit, when empty
-        type: string
-        default: ''
-      artifact:
-        description: What the artifacts the wheels are left in are named for, `<artifact>-<group>`
-        type: string
-        default: wheels
 
 permissions:
   contents: read
@@ -56,8 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
 
       - name: Plan the images and the wheels
@@ -89,8 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
 
       - name: Build the image
@@ -123,8 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
 
       - name: Version the crate as the tag
@@ -168,7 +150,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ inputs.artifact }}-${{ matrix.group.name }}
+          name: wheels-${{ matrix.group.name }}
           path: wheelhouse/*.whl
           # A wheel is a deflated zip already, so the archive this is wrapped in
           # cannot compress it further: leveling off spends no CPU re-deflating
