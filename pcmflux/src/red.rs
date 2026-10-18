@@ -57,3 +57,74 @@ pub(crate) fn red_blocks(payload: &[u8], primary_ts: i64) -> Option<(Blocks, usi
     nf += 1;
     Some((frames, nf))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One redundant block header: the follow bit, payload type 111, a 14-bit offset and a
+    /// 10-bit length.
+    fn header(offset: u32, len: u32) -> [u8; 4] {
+        let field = (offset << 10) | len;
+        [
+            0x80 | 111,
+            (field >> 16) as u8,
+            (field >> 8) as u8,
+            field as u8,
+        ]
+    }
+
+    #[test]
+    fn blocks_come_oldest_first_and_the_primary_takes_the_rest() {
+        let mut p = header(960, 3).to_vec();
+        p.push(111);
+        p.extend_from_slice(&[1, 2, 3, 9, 9]);
+        let (blocks, n) = red_blocks(&p, 10_000).expect("well formed");
+        assert_eq!(n, 2);
+        assert_eq!(blocks[0], (10_000 - 960, 5, 3));
+        assert_eq!(blocks[1], (10_000, 8, 2));
+    }
+
+    #[test]
+    fn an_empty_redundant_block_is_left_out() {
+        let mut p = header(960, 0).to_vec();
+        p.push(111);
+        p.extend_from_slice(&[7]);
+        let (blocks, n) = red_blocks(&p, 5_000).expect("well formed");
+        assert_eq!(n, 1);
+        assert_eq!(blocks[0], (5_000, 5, 1));
+    }
+
+    #[test]
+    fn a_payload_that_runs_out_is_refused() {
+        assert_eq!(red_blocks(&[], 0), None, "empty");
+        assert_eq!(
+            red_blocks(&header(960, 3)[..3], 0),
+            None,
+            "a header cut short"
+        );
+        assert_eq!(red_blocks(&header(960, 3), 0), None, "no primary header");
+        let mut p = header(960, 8).to_vec();
+        p.push(111);
+        p.extend_from_slice(&[1, 2]);
+        assert_eq!(red_blocks(&p, 0), None, "a block past the end");
+    }
+
+    #[test]
+    fn more_redundant_blocks_than_kept_are_refused() {
+        let mut p = Vec::new();
+        for _ in 0..=RED_MAX_DISTANCE {
+            p.extend_from_slice(&header(960, 0));
+        }
+        p.push(111);
+        p.push(1);
+        assert_eq!(red_blocks(&p, 0), None);
+        let mut ok = Vec::new();
+        for _ in 0..RED_MAX_DISTANCE {
+            ok.extend_from_slice(&header(960, 0));
+        }
+        ok.push(111);
+        ok.push(1);
+        assert!(red_blocks(&ok, 0).is_some(), "as many as kept are taken");
+    }
+}

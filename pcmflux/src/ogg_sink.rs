@@ -71,19 +71,31 @@ pub struct OggSink {
     seq: u32,
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0u32;
-    for &b in data {
-        crc ^= (b as u32) << 24;
-        for _ in 0..8 {
+/// Ogg's CRC-32 of every byte value, a byte at a time in place of a bit.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000_0000 != 0 {
                 (crc << 1) ^ CRC_POLY
             } else {
                 crc << 1
             };
+            bit += 1;
         }
+        table[i] = crc;
+        i += 1;
     }
-    crc
+    table
+};
+
+fn crc32(data: &[u8]) -> u32 {
+    data.iter().fold(0u32, |crc, &b| {
+        (crc << 8) ^ CRC_TABLE[((crc >> 24) ^ b as u32) as usize]
+    })
 }
 
 /// One page carrying one packet: the lacing table splits it into 255-byte segments, a
@@ -136,13 +148,15 @@ fn header_pages(serial: u32, head: &OpusHead) -> Vec<u8> {
 impl OggSink {
     /// Bind the socket at `path`, or say why it cannot be bound. A file there that another
     /// account owns is left alone and refused: in a shared directory it is that account's
-    /// listener, and a reader of this stream would reach it.
+    /// listener, and a reader of this stream would reach it. A file that is not a socket is
+    /// refused too, whoever owns it: a path named by mistake is never deleted.
     pub fn bind(path: &str, head: &OpusHead) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let stale = match fs::symlink_metadata(path) {
             Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
                 Err("another account owns it".to_string())
             }
+            Ok(meta) if !meta.file_type().is_socket() => Err("it is not a socket".to_string()),
             Ok(_) => fs::remove_file(path).map_err(|e| e.to_string()),
             Err(_) => Ok(()),
         };
@@ -251,7 +265,9 @@ mod tests {
     #[test]
     fn a_stale_socket_of_this_session_is_replaced() {
         let path = format!("/tmp/pcmflux-ogg-stale-{}.sock", std::process::id());
-        fs::write(&path, b"stale").unwrap();
+        let _ = fs::remove_file(&path);
+        // A listener gone without removing its socket file, as after a crash.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         let head = OpusHead {
             channels: 2,
             pre_skip: 312,
@@ -295,6 +311,52 @@ mod tests {
         assert!(peer_is_session_user(&peer));
         drop(sink);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The table gives what the polynomial gives a bit at a time: nothing for nothing, the
+    /// check value, and the same checksum over any bytes, zeros and every byte value included.
+    #[test]
+    fn the_checksum_table_agrees_with_the_polynomial() {
+        fn bitwise(data: &[u8]) -> u32 {
+            let mut crc = 0u32;
+            for &b in data {
+                crc ^= (b as u32) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 != 0 {
+                        (crc << 1) ^ CRC_POLY
+                    } else {
+                        crc << 1
+                    };
+                }
+            }
+            crc
+        }
+        assert_eq!(crc32(&[]), 0);
+        assert_eq!(crc32(&[0; 64]), 0);
+        assert_eq!(crc32(b"123456789"), 0x89a1_897f);
+        let every: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        for data in [&every[..], &every[..255], &every[1..256], &[0xff; 300][..]] {
+            assert_eq!(crc32(data), bitwise(data));
+        }
+    }
+
+    /// A file at the socket's path that is not a socket stays, whoever owns it.
+    #[test]
+    fn a_file_that_is_not_a_socket_is_left_alone() {
+        let path = format!("/tmp/pcmflux-ogg-file-{}", std::process::id());
+        fs::write(&path, b"kept").unwrap();
+        let head = OpusHead {
+            channels: 2,
+            pre_skip: 312,
+            input_sample_rate: 48000,
+            mapping: None,
+        };
+        let err = OggSink::bind(&path, &head)
+            .err()
+            .expect("a regular file is refused");
+        assert!(err.contains("not a socket"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"kept");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
