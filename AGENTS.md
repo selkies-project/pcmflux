@@ -45,6 +45,12 @@ peer's request) gets a target in `fuzz/fuzz_targets` that compiles the modules i
 needs none of the crate's system libraries, with seeds in `fuzz/seeds/<target>/` and its source among the
 workflow's `pull_request` paths. A crash the fuzzer finds is fixed at its cause, and its input joins the seeds.
 
+CodeQL's code scanning alerts are at least stylistic recommendations: each is fixed in the code and closed by the
+next scan, never dismissed or closed by hand, a case that is so by design included. Code that is safe through a check
+CodeQL cannot follow (a validator in another function, a bound set elsewhere) is rewritten so the check sits where
+the query recognizes it (its `*Customizations.qll` in github/codeql lists the forms), so the scan keeps watching
+that path.
+
 Priority: End-to-End Processing Latency > Resource Usage or Unrestricted Frame Rate >= Quality (non-perceptible or
 statistically insignificant latency fluctuations of up to 5% are acceptable in exchange for quality or bandwidth
 consistency, and slightly more GPU or CPU usage is also acceptable if it has no latency impact and brings a
