@@ -32,8 +32,9 @@ could not run where the hardware for them was not available.
 enter from the weakest principal up, what matters most, how to exercise it, and how severity is rated; `Dockerfile`
 builds the crate and runs its tests offline the way CI's cargo job does. The threat model is the rule the code is
 held to, not a description of it: where the code lets an input reach what the model keeps from it, the code is the
-defect even when its documentation and a test agree with it, and the fix corrects all three. Only a maintainer
-changes the rule itself. Keep the model current in the commit that moves it: a new socket, file written, or parser
+defect even when its documentation and a test agree with it, and the fix corrects all three. Anyone, an agent
+included, may change the rule to harden it (a principal reaching less, a boundary it did not state yet); loosening
+it is a maintainer's call. Keep the model current in the commit that moves it: a new socket, file written, or parser
 of bytes pcmflux does not write itself joins its entry points. Carry a new system package the build or the tests
 need into `Dockerfile`.
 
