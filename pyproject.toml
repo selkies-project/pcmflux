@@ -14,8 +14,15 @@ PATH = "$HOME/.cargo/bin:$PATH"
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
-    # Rust toolchain (the extension is pure Rust via setuptools-rust/PyO3).
-    curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # Rust toolchain (the extension is pure Rust via setuptools-rust/PyO3): rustup's
+    # installer for this machine, checked against the SHA-256 published beside it,
+    # rather than the script that downloads it unchecked.
+    libc="$(if command -v apk > /dev/null; then echo musl; else echo gnu; fi)"
+    url="https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-${libc}/rustup-init"
+    curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused -o /tmp/rustup-init "${url}"
+    sum="$(curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused "${url}.sha256")"
+    echo "${sum%% *}  /tmp/rustup-init" | sha256sum -c -
+    chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal && rm -f /tmp/rustup-init
     # libpulse (libpulse-sys links it) + libopus (opusic-sys builds the copy it vendors with
     # cmake and links it statically). gcc/cmake cover the -sys build steps. All four come from
     # the image's own repositories, so no third-party one (EPEL, RPM Fusion) is added.
