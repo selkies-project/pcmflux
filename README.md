@@ -146,6 +146,8 @@ ffmpeg -i unix:/run/user/1000/audio.sock -c:a copy capture.opus
 
 `AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. `cargo test --lib` covers the capture, encode, and assembly paths, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement. `pip wheel . --no-deps` builds the extension the way the released wheels are built, and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end audio suites.
 
+Releases are cut by running the [Release](https://github.com/selkies-project/pcmflux/actions/workflows/release.yml) workflow from the Actions tab, **Run workflow** with **Use workflow from** on `main` and the tag, or by pushing the tag. A run releases the commit it started from: a new tag is created on it once the checks pass, and a tag that already exists has to be on it, so an earlier commit's tag is released by a run started from that tag. The `latest` input decides the "Latest" badge: `auto` gives it to a release and not to a pre-release, `never` holds it back for a fix to an older series, and `always` gives it to a pre-release as well. The tag is the version the wheels carry, a PEP 440 one such as `2.1.0` or `2.1.0rc1`, and its notes are `release-notes/<tag>.md`, or for a pre-release the notes of the release it leads to. The `pypi` input decides whether the wheels go to PyPI as well: `auto` publishes a release designated as the latest and no pre-release.
+
 ## License
 
 This project is licensed under the **Mozilla Public License Version 2.0**.
