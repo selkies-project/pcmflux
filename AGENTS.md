@@ -1,9 +1,7 @@
 # Working on this repository
 
-pcmflux is the audio-capture and encode library behind
-[selkies](https://github.com/selkies-project/selkies), and is developed together with it and with
-[pixelflux](https://github.com/selkies-project/pixelflux) (screen capture and video encode). A change in one often
-belongs in another; coordinate across all three.
+pcmflux is the audio-capture and encode library in Selkies' `crates/pcmflux`, beside the server and
+[pixelflux](../pixelflux) (screen capture and video encode). Native changes and callers land in one commit.
 
 Use web search, web fetch, and other available tools as necessary. Make sure that the comments or documentation are
 not too verbose (do not add comments more fit for a PR summary than a comment). Do not leave arbitrary numbers (such
@@ -14,12 +12,18 @@ to an LLM bot or developer. Write American English -- color, behavior, center, i
 where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
 Empirical testing is possible for everything here, including implementation, auditing, validation, and verification,
-and every change is validated before it is reported. `cargo test --lib` and `pre-commit run --all-files`
-(rustfmt, clippy, ruff, and codespell) are the floor, and
-`cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement to quote rather
-than assert. The test binary links the interpreter because pyo3's `extension-module` is a crate feature the Python
-build alone asks for (`features` on the `RustExtension` in `setup.py`); putting it back on the pyo3 dependency itself
-would leave `cargo test` unable to link. The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver
+and every change is validated before it is reported. This crate is a Rust library (`rlib` and
+`cdylib`) whose public API (`AudioCapture`, `AudioPlayback`, the settings, `AudioFrame`, `AudioSink`, `Error`,
+`State`, `stop_all`) is everything in `src/lib.rs`; its `python` feature adds `src/python.rs`, the `pcmflux`
+extension module as thin wrappers over that API, and nothing in `lib.rs` names PyO3. Both configurations are tested on
+every change: `cargo test --lib` and `cargo clippy --all-targets -- -D warnings` without features (no interpreter is
+linked), the same two with `--features python`, and `pre-commit run --all-files` (rustfmt, both clippy configurations,
+ruff, and codespell) are the floor, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the
+assembly measurement to quote rather than assert. The test binary with `--features python` links the interpreter
+because pyo3's `extension-module` is a crate feature the Python build alone asks for (`features` on the `RustExtension`
+in `setup.py`); folding it into `python` would leave that test binary unable to link. Behavior is decided by the
+Python bridge: a default, a validation message, a timing, a buffer size, or a framing is the same through both
+bridges, and the Python side is the one the end-to-end suites measure. The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver
 pre-release the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the
 manifest and the lock, so a build ahead of a release carries the series version and a release the tag's. End to end, a change is a wheel (`pip wheel . --no-deps`) installed into a
 selkies sandbox as the Agentic Development section of that repository's `docs/development.md` describes, driven by its audio suites over
@@ -28,7 +32,7 @@ Safari. Ask before building an environment on a machine that was not set up for 
 closed package manager) and take the operator's directives on how it is constructed and constrained. Say which checks
 could not run where the hardware for them was not available.
 
-`.oss-scanner/` serves Anthropic's OSS Scanner. `threat_model.md` states what pcmflux does, where untrusted bytes
+`../../.oss-scanner/` serves Anthropic's OSS Scanner. Its unified `threat_model.md` covers pcmflux, where untrusted bytes
 enter from the weakest principal up, what matters most, how to exercise it, and how severity is rated; `Dockerfile`
 builds the crate and runs its tests offline the way CI's cargo job does. The threat model is the rule the code is
 held to, not a description of it: where the code lets an input reach what the model keeps from it, the code is the
@@ -38,8 +42,8 @@ it is a maintainer's call. Keep the model current in the commit that moves it: a
 of bytes pcmflux does not write itself joins its entry points. Carry a new system package the build or the tests
 need into `Dockerfile`.
 
-`.clusterfuzzlite/` builds `pcmflux/fuzz` (`cargo fuzz`) in an OSS-Fuzz builder for ClusterFuzzLite
-(`.github/workflows/fuzz.yml`: the code a pull request changes for five minutes, every target for an hour a day)
+`../../.clusterfuzzlite/` builds `crates/pcmflux/fuzz` (`cargo fuzz`) for ClusterFuzzLite
+(`../../.github/workflows/fuzz.yaml`: changed code for five minutes, every target for an hour a day)
 and OSS-Fuzz. Code that parses bytes pcmflux does not write itself (a microphone packet, a RED payload, a socket
 peer's request) gets a target in `fuzz/fuzz_targets` that compiles the modules it fuzzes through `#[path]`, so it
 needs none of the crate's system libraries, with seeds in `fuzz/seeds/<target>/` and its source among the
@@ -74,7 +78,7 @@ hanging or lagging. Performance preservation or improvements such as zero-copy a
 always important, and the GIL is held no longer than the work needs. End-to-end latency and an unrestricted frame
 rate are separate goals rather than two ends of one dial: neither is spent to buy the other. A change never drops a
 capability or falls back to an older implementation to make itself simpler; where one seems to be in the way, say
-what it is rather than removing it. Note that compatibility should be ensured for Python 3.9 to 3.15 or even higher.
+what it is rather than removing it. Note that compatibility should be ensured for GIL-enabled CPython 3.9 to 3.15 or even higher.
 A defect that predates the change you are making is still in scope: finding it does not make it someone else's,
 and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is broken, what you ruled out, and
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
@@ -94,7 +98,7 @@ An optional path another component may offer
 as the default: that it is exposed is not proof it works, and a reviewer has to be able to tell what runs where.
 
 `LICENSES.md` inventories the crates, the linked libpulse (LGPL-2.1-or-later), and the statically linked libopus (BSD-3-Clause);
-`pcmflux/deny.toml` keeps the crate graph permissive (the `Licenses` workflow runs it). A new crate that links
+`deny.toml` keeps the crate graph permissive (the root license workflow runs it). A new crate that links
 native code gets a row there.
 
 Update this file when certain details change.

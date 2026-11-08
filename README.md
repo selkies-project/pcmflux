@@ -1,33 +1,42 @@
+> [!IMPORTANT]
+> **pcmflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pcmflux) now.** This repository mirrors its `crates/pcmflux` directory, without history, for one release cycle: send issues and pull requests to Selkies. pcmflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the wheels of each Selkies pre-release are published here as a GitHub pre-release too. The first stable Selkies release after the move is published here as a GitHub release, and the mirror stops at the stable release after it, when this repository is archived. This tree is `crates/pcmflux` at selkies-project/selkies@98148af62.
+
 <h1 align="center">pcmflux</h1>
 
-<p align="center">Part of <a href="https://www.linuxserver.io"><img src="https://raw.githubusercontent.com/selkies-project/pcmflux/main/assets/linuxserver.svg" alt="LinuxServer.io" title="LinuxServer.io" width="182" align="middle"></a></p>
+<p align="center">Part of <a href="https://www.linuxserver.io"><img src="https://raw.githubusercontent.com/selkies-project/selkies/main/crates/pcmflux/assets/linuxserver.svg" alt="LinuxServer.io" title="LinuxServer.io" width="182" align="middle"></a></p>
 
-[![Tests](https://github.com/selkies-project/pcmflux/actions/workflows/tests.yml/badge.svg)](https://github.com/selkies-project/pcmflux/actions/workflows/tests.yml) [![Release](https://img.shields.io/github/v/release/selkies-project/pcmflux?display_name=tag)](https://github.com/selkies-project/pcmflux/releases/latest) [![PyPI](https://img.shields.io/pypi/v/pcmflux)](https://pypi.org/project/pcmflux/) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-pcmflux.selkies.io-blue)](https://pcmflux.selkies.io/) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/pcmflux)
+[![CI](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml/badge.svg)](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml) [![Release](https://img.shields.io/github/v/release/selkies-project/selkies?display_name=tag)](https://github.com/selkies-project/selkies/releases/latest) [![PyPI](https://img.shields.io/pypi/v/pcmflux)](https://pypi.org/project/pcmflux/) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-docs.selkies.io-blue)](https://docs.selkies.io/rustdoc/pcmflux/index.html) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/selkies)
 
-pcmflux is a high-performance audio capture and encoding module for Python.
+pcmflux is a high-performance audio capture and encoding library for Rust and Python.
 
-It is designed to capture system audio using PulseAudio, encode it into the Opus format, and stream it with low latency. A key optimization is its ability to detect and discard silent audio chunks, significantly reducing network traffic and CPU usage during periods of no sound.
+It is designed to capture system audio using PulseAudio, encode it into the Opus format, and stream it with low latency. A key optimization is its ability to detect and discard silent audio chunks, significantly reducing network traffic and CPU usage during periods of no sound. This directory's Rust crate is the library; its `python` feature adds the `pcmflux` extension module, thin wrappers over the same API, which the wheels build.
 
 ## Installation
 
-Every release on the [GitHub Releases page](https://github.com/selkies-project/pcmflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9 and newer), the pre-releases cut per commit included; take the one for your interpreter and platform:
+Every release on the [GitHub Releases page](https://github.com/selkies-project/selkies/releases) carries one `cp311-abi3` wheel per platform (`manylinux_2_28` and `musllinux_1_2`, x86_64 and aarch64), the pre-releases cut per commit included. A wheel installs on GIL-enabled CPython 3.11 and newer on its own libc and architecture; free-threaded CPython is not supported by ordinary abi3 wheels. The stable ABI covers only the CPython extension interface, not the native Opus, PulseAudio, Rust, libc, OS, or CPU-architecture interfaces. Native releases publish wheels only: on CPython 3.9/3.10, build the full-CPython-API extension from a source tree with `pip wheel . --no-deps` (or `pip install .`). Package `Requires-Python: >=3.9` covers that source build; it does not make a `cp311-abi3` wheel compatible with an older interpreter.
 ```bash
-pip install ./pcmflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install ./pcmflux-<version>-cp311-abi3-manylinux_2_28_x86_64.whl
 ```
 
 A wheel carries the PulseAudio client library it links, so all a host needs is a PulseAudio server, or PipeWire through `pipewire-pulse`, to capture from and play into.
 
 ### Building from source
 
-This package builds a native Rust extension (via `setuptools-rust`/PyO3). It requires a Rust toolchain (`cargo`/`rustc` 1.88 or newer) plus the PulseAudio development headers on your system.
+This package builds a native Rust extension (via `setuptools-rust`/PyO3, the crate's `python` and `extension-module` features). It requires a Rust toolchain (`cargo`/`rustc` 1.88 or newer) plus the PulseAudio development headers on your system.
 
 On Debian/Ubuntu, from the root of the repository:
 ```bash
 sudo apt-get install libpulse-dev cmake build-essential
-pip install .
+pip install ./crates/pcmflux
 ```
 
 The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and is linked statically, so `cmake` and a C compiler are always required and no system `libopus` is used.
+
+A Rust program depends on the crate directly, pinned to the release it goes with, with no Python involved:
+```toml
+[dependencies]
+pcmflux = { git = "https://github.com/selkies-project/selkies", tag = "<release>" }
+```
 
 ## Core Features
 
@@ -42,8 +51,7 @@ The Opus encoder is built from the copy of libopus that `opusic-sys` vendors and
 - **Mic-Uplink Playback:** An `AudioPlayback` class decodes an inbound Opus stream (with optional RED recovery via `write_red`) and plays it into a PulseAudio sink — the reverse of capture, for client microphone audio. Playback is mono/stereo, and `write` / `write_red` take any bytes-like object (`bytes`, `memoryview`, `bytearray`, ...). Queued audio that stays unplayed through a whole second (after a burst, a stalled client, a sink that resumed late, or a client clock running fast of the sink's) is cut from the head of the queue with a 2 ms crossfade, so the uplink's delay returns to the sink's own buffer (`latency_ms`) instead of standing up to `max_buffer_bytes`.
 - **Live Bitrate Updates:** Thread-safe `update_audio_bitrate()` adjusts the Opus bitrate during an active session.
 - **Observable Lifecycle:** `state` (`"idle"` / `"starting"` / `"running"` / `"failed"`) and `last_error` on both `AudioCapture` and `AudioPlayback`, so a capture that fails after `start_capture` returned (PulseAudio took longer than the start handshake, or dropped out mid-run and could not be reconnected) is visible to the caller. Invalid settings raise `ValueError` before a thread is spawned.
-- **PyO3 Extension Module:** A native Rust `pcmflux` extension module (full CPython API, not Limited/abi3) provides PulseAudio capture + Opus encoding.
-- **Python Build System:** Uses `setuptools-rust` to build and package the `pcmflux` PyO3 extension.
+- **Two Bridges, One Engine:** The Rust crate (`AudioCapture`, `AudioPlayback`, the settings, `AudioFrame`, the `AudioSink` trait) is the library; the `python` feature adds the native `pcmflux` extension module (CPython 3.11 Limited API / abi3 for release wheels; ordinary source builds and the plain `python` test feature retain the full API) as thin wrappers over it, and `setuptools-rust` builds and packages that module.
 
 ## Usage
 
@@ -117,13 +125,52 @@ capture.stop_capture()
   session, set `settings.opus_bitrate` before `start_capture()`; use
   `update_audio_bitrate()` only to adjust a session that is already running.
 
+## Rust API
+
+The same engine, without an interpreter: `AudioCapture::start(&settings, sink)` takes an
+`AudioCaptureSettings` (its `Default` is the Python class's) and an `Option<Arc<dyn AudioSink>>`,
+where any `Fn(AudioFrame) + Send + Sync` is a sink, called on the delivery thread once per
+encoded frame exactly as the Python callback is. An `AudioFrame` exposes `as_bytes()`, `pts()`,
+and `channels()`, and recycles its buffer to the capture when dropped, so copy it out to keep it.
+Validation happens in one place, `AudioCaptureSettings::validate` (and the playback's), and a
+refused call is an `Error`: `Error::Settings` for what Python raises as `ValueError`,
+`Error::Start` and `Error::NotRunning` for its `RuntimeError`s. The lifecycle reads through
+`state()` (`State::Idle` / `Starting` / `Running` / `Failed`, spelled as Python's `state` by
+`as_str()`) and `last_error()`; `is_capturing()`, `update_audio_bitrate()`, and
+`set_stereo_companion()` behave as their Python namesakes, and `stop_all()` is what the Python
+module runs at interpreter exit. `AudioPlayback` mirrors `AudioCapture` with `start`, `write`,
+`write_red`, `stop`, `is_running`, `state`, and `last_error`. A `stop` joins the capture
+thread, which joins the delivery thread, so a sink must not make `stop` wait on a lock its own
+in-flight call holds; the Python bridge releases the GIL around every join for that reason.
+
+```rust
+use std::sync::Arc;
+use pcmflux::{AudioCapture, AudioCaptureSettings, AudioFrame, AudioSink};
+
+let settings = AudioCaptureSettings {
+    frame_duration_ms: 20.0,
+    opus_complexity: Some(5),
+    ..AudioCaptureSettings::default()
+};
+let sink: Arc<dyn AudioSink> = Arc::new(|frame: AudioFrame| {
+    let data = frame.as_bytes().to_vec(); // header+Opus, or raw Opus per settings
+    let pts = frame.pts();                // presentation timestamp, in samples
+    // send `data` to your client...
+});
+let capture = AudioCapture::new();
+capture.start(&settings, Some(sink))?;
+// capture.update_audio_bitrate(96000);
+// ...
+capture.stop();
+```
+
 ## Example Usage
 
 The `example` directory contains a standalone demo that captures system audio, broadcasts it over a WebSocket, and plays it back in a web browser using the WebCodecs API.
 
 To run the example:
 
-1.  Install the module: `pip3 install .`, or a wheel from the [GitHub Releases page](https://github.com/selkies-project/pcmflux/releases)
+1.  Install the module: `pip3 install .`, or a wheel from the [GitHub Releases page](https://github.com/selkies-project/selkies/releases)
 2.  Run the server: `cd example && python3 audio_to_browser.py`
 3.  Open `http://localhost:9001` in a modern web browser (Chrome, Edge, etc.).
 
@@ -144,13 +191,13 @@ ffmpeg -i unix:/run/user/1000/audio.sock -c:a copy capture.opus
 
 ## Development
 
-`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. `cargo test --lib` covers the capture, encode, and assembly paths, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement. `pip wheel . --no-deps` builds the extension the way the released wheels are built, and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end audio suites.
+`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. `cargo test --lib` covers the capture, encode, and assembly paths without an interpreter, `cargo test --lib --features python` adds the Python bridge, and `cargo test --release bench_emit_assembly -- --ignored --nocapture` prints the assembly measurement. `pip wheel . --no-deps` builds the extension the way the released wheels are built, and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end audio suites.
 
-Releases are cut by running the [Release](https://github.com/selkies-project/pcmflux/actions/workflows/release.yml) workflow from the Actions tab, **Run workflow** with **Use workflow from** on `main` and the tag, or by pushing the tag. A run releases the commit it started from: a new tag is created on it once the checks pass, and a tag that already exists has to be on it, so an earlier commit's tag is released by a run started from that tag. The `latest` input decides the "Latest" badge: `auto` gives it to a release and not to a pre-release, `never` holds it back for a fix to an older series, and `always` gives it to a pre-release as well. The tag is the version the wheels carry, a PEP 440 one such as `2.1.0` or `2.1.0rc1`, and its notes are `release-notes/<tag>.md`, or for a pre-release the notes of the release it leads to. The `pypi` input decides whether the wheels go to PyPI as well: `auto` publishes a release designated as the latest and no pre-release.
+Selkies' [Release](https://github.com/selkies-project/selkies/actions/workflows/release.yaml) workflow builds pcmflux from `crates/pcmflux` and attaches its CPython 3.11+ `cp311-abi3` wheels beside the server artifacts. The tag stamps this crate's literal Cargo version, its standalone lock, and the root lock together. `release-published.yaml` uploads the wheels through PyPI trusted publishing. Before the standalone repository and its Pages site can be archived, a maintainer must register the pcmflux trusted publisher for Selkies' `release-published.yaml` and `pypi` environment and migrate the old documentation destination; neither external registration nor archival is performed by this source tree.
 
 ## License
 
 This project is licensed under the **Mozilla Public License Version 2.0**.
 A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
 
-[LICENSES.md](LICENSES.md) inventories the third-party components of a built `pcmflux` (crates, the linked libpulse and libopus, what the wheels bundle) with their licenses, and describes the cargo-deny check (`pcmflux/deny.toml`, the `Licenses` workflow) that keeps the crate graph permissive.
+[LICENSES.md](LICENSES.md) inventories the third-party components of a built `pcmflux` (crates, the linked libpulse and libopus, what the wheels bundle) with their licenses, and describes the cargo-deny check (`deny.toml`, the root license checks) that keeps the crate graph permissive.

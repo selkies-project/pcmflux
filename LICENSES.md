@@ -2,7 +2,7 @@
 
 pcmflux itself is licensed under the [Mozilla Public License 2.0](LICENSE).
 This file inventories what a built `pcmflux` extension contains or loads and
-the license of each piece; `pcmflux/deny.toml` and the `Licenses` workflow keep
+the license of each piece; `deny.toml` and the root license checks keep
 the crate graph to the licenses listed here.
 
 Categories: copyleft (GPL-style: the combined binary must follow the license),
@@ -44,7 +44,7 @@ covered by cargo-deny.
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | permissive |  |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | permissive |  |
 | opusic-sys | 0.7.6 | BSD-3-Clause | permissive | libopus: BSD-3-Clause (permissive), built from the vendored source with cmake and linked statically |
-| pcmflux | 2.2.1 | MPL-2.0 | permissive (file-level copyleft) | repository LICENSE; Cargo.toml has no license field |
+| pcmflux | 2.2.1 | MPL-2.0 | permissive (file-level copyleft) |  |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | permissive |  |
 | pyo3 | 0.30.1 | MIT OR Apache-2.0 | permissive |  |
 | pyo3-ffi | 0.30.1 | MIT OR Apache-2.0 | permissive | libpython: PSF-2.0, symbols resolved from the interpreter, not linked |
@@ -78,11 +78,11 @@ covered by cargo-deny.
 
 ## How this is enforced
 
-`pcmflux/deny.toml` is the [cargo-deny](https://embarkstudios.github.io/cargo-deny/)
+`deny.toml` is the [cargo-deny](https://embarkstudios.github.io/cargo-deny/)
 policy: the allow list is permissive-only (MIT, Apache-2.0, Apache-2.0 WITH
 LLVM-exception, ISC, Zlib, Unicode-3.0, MPL-2.0), so a GPL, LGPL, or unlicensed
 crate fails `cargo deny --exclude-dev check licenses bans sources` (run from
-`pcmflux/`), which `.github/workflows/licenses.yml` runs on every push and pull
-request. The native libraries above are outside what crate metadata describes:
-a new binding crate means a new row here. `pcmflux/Cargo.toml` has no
-`license = "MPL-2.0"` field; `deny.toml` clarifies it.
+this directory). The root license workflow inventories the same graph; this
+command audits the standalone package. The native libraries above are outside what crate metadata describes:
+a new binding crate means a new row here. `Cargo.toml` declares
+`license = "MPL-2.0"`; `deny.toml` audits the rest of the crate graph.
